@@ -1,0 +1,168 @@
+{
+  "projectType": "framework",
+  "projectName": "Magpie",
+  "projectDescription": "Autonomous AI coding pipeline that takes tasks from chat, writes code with AI agents, runs CI, and opens pull requests.",
+  "theme": "aspen",
+  "primaryColor": "#E63946",
+  "lightColor": "#F1FAEE",
+  "darkColor": "#1D3557",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/pipeline",
+              "concepts/blueprints",
+              "concepts/two-tier-agent",
+              "concepts/task-classification",
+              "concepts/sandbox"
+            ]
+          },
+          {
+            "group": "Chat Adapters",
+            "pages": [
+              "adapters/discord",
+              "adapters/teams",
+              "adapters/cli",
+              "adapters/custom"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/pipeline",
+              "configuration/environment",
+              "configuration/plane",
+              "configuration/sandbox"
+            ]
+          },
+          {
+            "group": "Blueprints",
+            "pages": [
+              "blueprints/overview",
+              "blueprints/simple",
+              "blueprints/tdd",
+              "blueprints/diagnostic",
+              "blueprints/custom"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/org-scoped-repos",
+              "advanced/tracing",
+              "advanced/ci-classification",
+              "advanced/daytona-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core",
+            "pages": [
+              "api/pipeline",
+              "api/agent",
+              "api/blueprint-engine",
+              "api/git-ops"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "api/chat-platform",
+              "api/sandbox",
+              "api/plane-client",
+              "api/repo-resolution"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/types/pipeline-config",
+              "api/types/pipeline-result",
+              "api/types/task-complexity",
+              "api/types/blueprint"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Deployment",
+            "pages": [
+              "guides/deploying-discord-bot",
+              "guides/deploying-teams-bot",
+              "guides/docker-setup"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "guides/contributing",
+              "guides/testing",
+              "guides/debugging"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/simple-task",
+              "examples/feature-with-tdd",
+              "examples/bug-fix",
+              "examples/multi-repo"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "End-to-end autonomous coding pipeline from task to PR",
+    "Two-tier LLM architecture with Goose agent for coding and Claude CLI for text generation",
+    "Blueprint engine with deterministic Shell steps and AI Agent steps",
+    "Task classification (Simple/Standard/BugFix) with blueprint selection",
+    "Built-in TDD and diagnostic blueprints for feature development and bug fixes",
+    "CI loop with automatic lint, test, and fix retries",
+    "Multi-platform chat adapters (Discord, Teams, CLI)",
+    "Org-scoped repo resolution for multi-repository workflows",
+    "Sandbox abstraction with local and Daytona support",
+    "Plane integration for issue tracking",
+    "JSONL tracing and observability",
+    "Git operations with collision handling and PR automation"
+  ],
+  "publicApiSurface": [
+    "run_pipeline() - Main pipeline orchestrator",
+    "MagpieAgent - Goose agent wrapper for coding tasks",
+    "BlueprintRunner - Executes blueprints with Shell and Agent steps",
+    "ChatPlatform trait - Implement for custom chat adapters",
+    "Sandbox trait - Implement for custom sandbox backends",
+    "GitOps - Git operations (branch, commit, push, PR)",
+    "PlaneClient - Plane issue tracker integration",
+    "classify_task() - Classify task complexity",
+    "build_main_blueprint() - Simple single-shot agent blueprint",
+    "build_tdd_blueprint() - TDD blueprint for features",
+    "build_diagnostic_blueprint() - Diagnostic blueprint for bug fixes",
+    "build_fix_blueprint() - Fix blueprint for CI failures",
+    "LocalSandbox - Local command execution sandbox",
+    "DaytonaSandbox - Daytona remote sandbox",
+    "clone_repo() - Org-scoped repo resolution and cloning",
+    "TraceBuilder - Agent call tracing and observability"
+  ]
+}
