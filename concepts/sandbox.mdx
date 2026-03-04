@@ -1,0 +1,555 @@
+---
+title: Sandbox Abstraction
+description: Isolated execution environments for local and remote command execution
+---
+
+All commands and file operations in Magpie route through the `Sandbox` trait, providing full isolation between pipeline runs and support for both local and remote execution environments.
+
+## Sandbox Trait
+
+```rust title="sandbox/mod.rs:62-90"
+#[async_trait]
+pub trait Sandbox: Send + Sync {
+    /// Human-readable name for this sandbox type (e.g. "local", "daytona").
+    fn name(&self) -> &str;
+
+    /// The root working directory inside this sandbox.
+    fn working_dir(&self) -> &str;
+
+    /// Execute a command with arguments inside the sandbox.
+    async fn exec(&self, command: &str, args: &[&str]) -> Result<ExecOutput>;
+
+    /// Execute a shell command string (passed to `sh -c`).
+    async fn exec_shell(&self, shell_cmd: &str) -> Result<ExecOutput> {
+        self.exec("sh", &["-c", shell_cmd]).await
+    }
+
+    /// Read a file from the sandbox filesystem.
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>>;
+
+    /// Write a file to the sandbox filesystem.
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
+
+    /// Destroy the sandbox and clean up resources.
+    async fn destroy(&self) -> Result<()>;
+}
+```
+
+## ExecOutput
+
+Standardized command result:
+
+```rust title="sandbox/mod.rs:24-43"
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+impl ExecOutput {
+    /// Combine stdout and stderr, preferring whichever is non-empty.
+    pub fn combined(&self) -> String {
+        if self.stderr.is_empty() {
+            self.stdout.clone()
+        } else if self.stdout.is_empty() {
+            self.stderr.clone()
+        } else {
+            format!("{}\n{}", self.stdout, self.stderr)
+        }
+    }
+}
+```
+
+## LocalSandbox
+
+Executes commands locally via `std::process::Command`.
+
+### Structure
+
+```rust title="sandbox/local.rs:15-55"
+pub struct LocalSandbox {
+    working_dir: PathBuf,
+    /// If we own a temp dir (from clone), keep it alive and clean up on destroy.
+    _temp_dir: Mutex<Option<tempfile::TempDir>>,
+}
+
+impl LocalSandbox {
+    /// Create a sandbox backed by an existing local directory.
+    ///
+    /// No cleanup is performed on `destroy()`.
+    pub fn from_path(path: PathBuf) -> Self {
+        Self {
+            working_dir: path,
+            _temp_dir: Mutex::new(None),
+        }
+    }
+
+    /// Clone a repo into a temp directory and use it as the sandbox working dir.
+    ///
+    /// The temp directory is cleaned up on `destroy()` (or when the sandbox is dropped).
+    pub fn from_clone(repo_name: &str, org: &str) -> Result<Self> {
+        let full_name = format!("{org}/{repo_name}");
+        let temp_dir = tempfile::tempdir()?;
+        let clone_target = temp_dir.path().join(repo_name);
+
+        let output = std::process::Command::new("gh")
+            .args(["repo", "clone", &full_name, clone_target.to_str().unwrap()])
+            .output()
+            .context("failed to run gh repo clone")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh repo clone failed for '{full_name}': {stderr}");
+        }
+
+        Ok(Self {
+            working_dir: clone_target,
+            _temp_dir: Mutex::new(Some(temp_dir)),
+        })
+    }
+}
+```
+
+### Implementation
+
+```rust title="sandbox/local.rs:58-102"
+#[async_trait]
+impl Sandbox for LocalSandbox {
+    fn name(&self) -> &str {
+        "local"
+    }
+
+    fn working_dir(&self) -> &str {
+        self.working_dir.to_str().unwrap_or(".")
+    }
+
+    async fn exec(&self, command: &str, args: &[&str]) -> Result<ExecOutput> {
+        let output = std::process::Command::new(command)
+            .args(args)
+            .current_dir(&self.working_dir)
+            .output()
+            .with_context(|| format!("failed to run {command} {}", args.join(" ")))?;
+
+        Ok(ExecOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let full_path = self.working_dir.join(path);
+        std::fs::read(&full_path).with_context(|| format!("failed to read {}", full_path.display()))
+    }
+
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
+        let full_path = self.working_dir.join(path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&full_path, content)
+            .with_context(|| format!("failed to write {}", full_path.display()))
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        // Drop the temp dir if we own one — this deletes the directory.
+        let mut guard = self._temp_dir.lock().unwrap();
+        *guard = None;
+        Ok(())
+    }
+}
+```
+
+<Info>
+`LocalSandbox::from_path()` uses an existing directory (no cleanup on destroy). `LocalSandbox::from_clone()` clones a repo into a temp dir and cleans it up on destroy.
+</Info>
+
+## DaytonaSandbox
+
+Executes commands in a remote Daytona environment via REST API.
+
+### Configuration
+
+```rust title="sandbox/mod.rs:45-60"
+#[derive(Debug, Clone)]
+pub struct DaytonaConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub organization_id: Option<String>,
+    pub sandbox_class: String,
+    /// Daytona snapshot name to create sandboxes from (pre-built image).
+    pub snapshot_name: Option<String>,
+    /// Environment variables to inject into the sandbox at creation time.
+    pub env_vars: std::collections::HashMap<String, String>,
+    /// Persistent volume ID for build cache (e.g. cargo target dir).
+    pub volume_id: Option<String>,
+    /// Mount point for the persistent volume inside the sandbox.
+    pub volume_mount_path: Option<String>,
+}
+```
+
+### Structure
+
+```rust title="sandbox/daytona.rs:16-30"
+pub struct DaytonaSandbox {
+    client: DaytonaClient,
+    sandbox_id: Uuid,
+    working_dir: String,
+}
+```
+
+### Creation Methods
+
+#### Cold Clone
+
+Create a sandbox and clone the repo inside it:
+
+```rust title="sandbox/daytona.rs:32-88"
+pub async fn create(config: &DaytonaConfig, repo_full_name: &str) -> Result<Self> {
+    let daytona_config = daytona_client::DaytonaConfig::new(&config.api_key)
+        .with_base_url(&config.base_url)
+        .with_timeout(600);
+
+    let daytona_config = if let Some(ref org_id) = config.organization_id {
+        daytona_config.with_organization_id(org_id)
+    } else {
+        daytona_config
+    };
+
+    let client = DaytonaClient::new(daytona_config)
+        .context("failed to create Daytona client")?;
+
+    let env = if config.env_vars.is_empty() {
+        None
+    } else {
+        Some(config.env_vars.clone())
+    };
+
+    let sandbox = client
+        .sandboxes()
+        .create(CreateSandboxParams {
+            class: Some(config.sandbox_class.clone()),
+            env,
+            ..Default::default()
+        })
+        .await
+        .context("failed to create Daytona sandbox")?;
+
+    let sandbox_id = sandbox.id;
+    let working_dir = format!("/workspace/{}", repo_full_name.replace('/', "-"));
+
+    // Clone the repo inside the sandbox
+    let clone_cmd = format!("gh repo clone {repo_full_name} {working_dir}");
+    let result = client
+        .process()
+        .execute_command(&sandbox_id, &clone_cmd)
+        .await
+        .context("failed to clone repo inside Daytona sandbox")?;
+
+    if result.exit_code != 0 {
+        // Clean up the sandbox on failure
+        let _ = client.sandboxes().delete(&sandbox_id).await;
+        anyhow::bail!("gh repo clone failed inside sandbox: {}", result.result);
+    }
+
+    Ok(Self {
+        client,
+        sandbox_id,
+        working_dir,
+    })
+}
+```
+
+#### From Snapshot
+
+Create from a pre-built image (much faster):
+
+```rust title="sandbox/daytona.rs:90-221"
+pub async fn create_from_snapshot(
+    config: &DaytonaConfig,
+    snapshot_name: &str,
+    working_dir: &str,
+    env: HashMap<String, String>,
+    volumes: Vec<SandboxVolumeAttachment>,
+) -> Result<Self> {
+    let daytona_config = daytona_client::DaytonaConfig::new(&config.api_key)
+        .with_base_url(&config.base_url)
+        .with_timeout(600);
+
+    let daytona_config = if let Some(ref org_id) = config.organization_id {
+        daytona_config.with_organization_id(org_id)
+    } else {
+        daytona_config
+    };
+
+    let client = DaytonaClient::new(daytona_config)
+        .context("failed to create Daytona client")?;
+
+    info!(snapshot = snapshot_name, "creating sandbox from snapshot");
+
+    let sandbox = client
+        .sandboxes()
+        .create(CreateSandboxParams {
+            snapshot: Some(snapshot_name.to_string()),
+            class: Some(config.sandbox_class.clone()),
+            env: if env.is_empty() { None } else { Some(env) },
+            volumes: if volumes.is_empty() { None } else { Some(volumes) },
+            ..Default::default()
+        })
+        .await
+        .context("failed to create sandbox from snapshot")?;
+
+    let sandbox_id = sandbox.id;
+
+    // Wait for the sandbox to reach Started state (large images can take 5 min)
+    info!(sandbox_id = %sandbox_id, "waiting for sandbox to reach Started state");
+    client
+        .sandboxes()
+        .wait_for_state(
+            &sandbox_id,
+            daytona_client::SandboxState::Started,
+            300, // max 5 minutes
+        )
+        .await
+        .context("sandbox did not reach Started state")?;
+
+    // Configure git and permissions
+    let setup_cmd = format!(
+        "sh -c '\
+         sudo git config --system --add safe.directory {} 2>/dev/null || true; \
+         sudo git config --system user.email magpie@bot 2>/dev/null || true; \
+         sudo git config --system user.name Magpie 2>/dev/null || true; \
+         sudo chmod -R 777 {wd} 2>/dev/null || true; \
+         cd {wd} && git checkout -- . 2>/dev/null || true; \
+         gh auth setup-git 2>/dev/null || true'",
+        working_dir,
+        wd = working_dir
+    );
+    let setup_result = client
+        .process()
+        .execute_command(&sandbox_id, &setup_cmd)
+        .await
+        .context("failed to configure workspace")?;
+
+    info!(
+        sandbox_id = %sandbox_id,
+        exit_code = setup_result.exit_code,
+        "workspace setup completed"
+    );
+
+    Ok(Self {
+        client,
+        sandbox_id,
+        working_dir: working_dir.to_string(),
+    })
+}
+```
+
+<Note>
+**Snapshots** are Docker images built ahead of time with the repo, toolchain (Rust/cargo), and dependencies pre-installed. This reduces sandbox creation time from ~5 minutes to ~30 seconds.
+</Note>
+
+### Implementation
+
+```rust title="sandbox/daytona.rs:244-319"
+#[async_trait]
+impl Sandbox for DaytonaSandbox {
+    fn name(&self) -> &str {
+        "daytona"
+    }
+
+    fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+
+    async fn exec(&self, command: &str, args: &[&str]) -> Result<ExecOutput> {
+        // Build command string for remote execution.
+        // Daytona's execute_command does NOT use a shell, so we must wrap in
+        // `sh -c '...'` to support shell operators (&&, |, etc.) and cd.
+        let inner = if args.is_empty() {
+            format!("cd {} && {}", self.working_dir, command)
+        } else {
+            let args_str = args
+                .iter()
+                .map(|a| shell_escape(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("cd {} && {} {}", self.working_dir, command, args_str)
+        };
+        let full_cmd = format!("sh -c {}", shell_escape(&inner));
+
+        let result = self
+            .client
+            .process()
+            .execute_command(&self.sandbox_id, &full_cmd)
+            .await
+            .with_context(|| format!("sandbox exec failed: {command}"))?;
+
+        Ok(ExecOutput {
+            stdout: result.result.clone(),
+            stderr: String::new(), // Daytona combines output into result
+            exit_code: result.exit_code,
+        })
+    }
+
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let full_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/{}", self.working_dir, path)
+        };
+
+        self.client
+            .files()
+            .download(&self.sandbox_id, &full_path)
+            .await
+            .with_context(|| format!("failed to read file from sandbox: {full_path}"))
+    }
+
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
+        let full_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/{}", self.working_dir, path)
+        };
+
+        self.client
+            .files()
+            .upload(&self.sandbox_id, &full_path, content)
+            .await
+            .with_context(|| format!("failed to write file to sandbox: {full_path}"))
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        self.client
+            .sandboxes()
+            .delete(&self.sandbox_id)
+            .await
+            .context("failed to destroy Daytona sandbox")
+    }
+}
+```
+
+### Shell Escaping
+
+```rust title="sandbox/daytona.rs:321-331"
+fn shell_escape(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.')
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+```
+
+<Info>
+Daytona's `execute_command` API does NOT invoke a shell by default, so Magpie wraps all commands in `sh -c` to support shell operators like `&&`, `|`, and `cd`.
+</Info>
+
+## MockSandbox
+
+Test double for deterministic testing:
+
+```rust title="sandbox/mock.rs"
+pub struct MockSandbox {
+    working_dir: String,
+    responses: Arc<Mutex<HashMap<String, ExecOutput>>>,
+    recorded: Arc<Mutex<Vec<RecordedCall>>>,
+}
+
+impl MockSandbox {
+    pub fn new(working_dir: impl Into<String>) -> Self {
+        Self {
+            working_dir: working_dir.into(),
+            responses: Arc::new(Mutex::new(HashMap::new())),
+            recorded: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn with_response(self, command: impl Into<String>, output: ExecOutput) -> Self {
+        self.responses.lock().unwrap().insert(command.into(), output);
+        self
+    }
+
+    pub fn recorded(&self) -> Vec<RecordedCall> {
+        self.recorded.lock().unwrap().clone()
+    }
+}
+```
+
+## Usage in Pipeline
+
+```rust title="pipeline.rs:748-909"
+let sandbox: Box<dyn Sandbox> = if let Some(ref org) = config.github_org {
+    let repo_name = repo::parse_repo_from_message(task)?;
+    let full_name = format!("{org}/{repo_name}");
+    repo::validate_org(&full_name, org)?;
+
+    #[cfg(feature = "daytona")]
+    if let Some(ref daytona_cfg) = config.daytona {
+        if let Some(ref snapshot) = daytona_cfg.snapshot_name {
+            // Fast: create from snapshot
+            Box::new(DaytonaSandbox::create_from_snapshot(
+                daytona_cfg,
+                snapshot,
+                "/workspace/magpie",
+                daytona_cfg.env_vars.clone(),
+                Vec::new(),
+            ).await?)
+        } else {
+            // Slow: cold clone
+            Box::new(DaytonaSandbox::create(daytona_cfg, &full_name).await?)
+        }
+    } else {
+        Box::new(LocalSandbox::from_clone(&repo_name, org)?)
+    }
+} else {
+    Box::new(LocalSandbox::from_path(config.repo_dir.clone()))
+};
+```
+
+## Comparison
+
+| Feature | LocalSandbox | DaytonaSandbox |
+|---------|--------------|----------------|
+| **Execution** | `std::process::Command` | REST API to remote sandbox |
+| **Isolation** | Process-level | Full VM/container |
+| **Cleanup** | Optional (temp dirs) | Always (sandbox destroyed) |
+| **Concurrency** | Share host resources | Independent sandboxes |
+| **Snapshots** | N/A | Supported (fast creation) |
+| **Use case** | Local dev/testing | Production (Discord/Teams bots) |
+
+## Design Benefits
+
+<AccordionGroup>
+  <Accordion title="Full Isolation">
+    Each pipeline run gets its own sandbox. No cross-contamination between concurrent tasks.
+  </Accordion>
+  
+  <Accordion title="Pluggable Backends">
+    The trait allows swapping local/remote execution without changing pipeline code.
+  </Accordion>
+  
+  <Accordion title="Testability">
+    `MockSandbox` enables deterministic unit tests without running real commands.
+  </Accordion>
+  
+  <Accordion title="Remote Execution">
+    Daytona sandboxes enable running Magpie in environments without local tool access (e.g. Discord bot on a minimal container).
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Blueprint Engine" icon="diagram-project" href="/concepts/blueprints">
+    See how blueprints execute Shell and Agent steps via sandboxes
+  </Card>
+  <Card title="Two-Tier Agent" icon="layer-group" href="/concepts/two-tier-agent">
+    Learn how agent steps dispatch differently in local vs remote sandboxes
+  </Card>
+</CardGroup>

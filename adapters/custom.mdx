@@ -1,0 +1,848 @@
+---
+title: Custom Adapter
+description: Build your own Magpie adapter for Slack, Telegram, or any chat platform
+icon: code
+---
+
+Magpie's adapter architecture is designed for extensibility. Implement the `ChatPlatform` trait to integrate any chat system, notification service, or automation tool.
+
+## Architecture Overview
+
+All Magpie adapters follow this pattern:
+
+<Steps>
+  <Step title="Implement ChatPlatform trait">
+    Four required methods: `name()`, `fetch_history()`, `send_message()`, and `close_thread()` (optional).
+  </Step>
+  
+  <Step title="Build PipelineConfig from environment">
+    Read configuration from env vars (repo path, CI commands, integrations).
+  </Step>
+  
+  <Step title="Call run_pipeline()">
+    Magpie's core orchestrates branch creation, agent work, CI, PR, and cleanup.
+  </Step>
+  
+  <Step title="Handle platform-specific events">
+    Receive messages/webhooks, strip mentions, extract user info, spawn pipeline in background.
+  </Step>
+</Steps>
+
+## The ChatPlatform Trait
+
+The `ChatPlatform` trait defines the contract every adapter must implement:
+
+```rust crates/magpie-core/src/platform.rs
+use anyhow::Result;
+use async_trait::async_trait;
+
+/// The contract every chat plugin implements.
+#[async_trait]
+pub trait ChatPlatform: Send + Sync {
+    /// Platform identifier (e.g., "discord", "teams", "slack").
+    fn name(&self) -> &str;
+
+    /// Fetch conversation history from a channel/thread, formatted as text.
+    async fn fetch_history(&self, channel_id: &str) -> Result<String>;
+
+    /// Send a message to a channel/thread.
+    async fn send_message(&self, channel_id: &str, text: &str) -> Result<()>;
+
+    /// Close / archive a thread after the final response has been sent.
+    ///
+    /// Default is a no-op — platforms that support thread archiving (e.g. Discord)
+    /// override this.
+    async fn close_thread(&self, _channel_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+```
+
+### Method Details
+
+#### name() -> &str
+
+**Purpose**: Platform identifier for logging and debugging.
+
+**Examples**:
+- `"discord"` — Discord bot
+- `"teams"` — Microsoft Teams webhook
+- `"slack"` — Slack bot
+- `"cli"` — Command-line interface
+
+**Usage in Magpie**:
+```rust
+tracing::info!(platform = platform.name(), "starting pipeline");
+```
+
+#### fetch_history(channel_id: &str) -> Result\<String>
+
+**Purpose**: Retrieve conversation history to provide context to the AI agent.
+
+**Parameters**:
+- `channel_id`: Platform-specific channel/thread identifier
+
+**Return**: Formatted text of recent messages (e.g., last 10-50 messages).
+
+**Current implementations**:
+- **Discord**: Returns empty string (task is self-contained in mention)
+- **Teams**: Returns empty string (Graph API integration not yet implemented)
+- **CLI**: Returns empty string (no chat history)
+
+**Future use cases**:
+- Multi-turn conversations where agent needs full context
+- Bug reports with multiple messages of diagnostic info
+- Design discussions where agent should understand full thread
+
+**Example implementation** (Slack):
+```rust
+async fn fetch_history(&self, channel_id: &str) -> Result<String> {
+    let resp = self.client
+        .get("https://slack.com/api/conversations.history")
+        .query(&[("channel", channel_id), ("limit", "50")])
+        .bearer_auth(&self.token)
+        .send()
+        .await?
+        .json::<HistoryResponse>()
+        .await?;
+    
+    let mut messages = Vec::new();
+    for msg in resp.messages {
+        messages.push(format!("{}: {}", msg.user, msg.text));
+    }
+    
+    Ok(messages.join("\n"))
+}
+```
+
+#### send_message
+
+**Purpose**: Post a message to the chat platform.
+
+**Parameters**:
+- `channel_id`: Target channel/thread identifier
+- `text`: Message content (plain text or platform-specific formatting)
+
+**Usage in Magpie**:
+- Acknowledgment: "⏳ **Got it** — working on this now…"
+- Final result: PR link, CI status, error messages
+
+**Example implementation** (Telegram):
+```rust
+async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
+    
+    self.client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": channel_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    
+    Ok(())
+}
+```
+
+#### close_thread
+
+**Purpose**: Archive/lock a thread after pipeline completion (optional).
+
+**Default behavior**: No-op (returns `Ok(())`).
+
+**Override when**:
+- Platform supports thread archiving (Discord)
+- You want to prevent further interaction after task completion
+- Cleanup/notification is needed
+
+**Example implementation** (Discord):
+```rust
+async fn close_thread(&self, channel_id: &str) -> Result<()> {
+    let id: u64 = channel_id.parse()?;
+    let channel = ChannelId::new(id);
+    
+    channel
+        .edit_thread(&self.http, EditThread::new().archived(true).locked(true))
+        .await?;
+    
+    Ok(())
+}
+```
+
+## Building a Custom Adapter
+
+Let's build a complete Slack adapter as an example.
+
+### Project Structure
+
+```bash
+crates/
+  magpie-slack/
+    Cargo.toml
+    src/
+      main.rs      # Entry point, event listener setup
+      adapter.rs   # ChatPlatform implementation
+      events.rs    # Slack event handling
+      auth.rs      # OAuth token management (optional)
+```
+
+### Cargo.toml
+
+```toml crates/magpie-slack/Cargo.toml
+[package]
+name = "magpie-slack"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "magpie-slack"
+path = "src/main.rs"
+
+[dependencies]
+magpie-core = { path = "../magpie-core" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Web framework
+axum = "0.7"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Environment
+dotenvy = "0.15"
+```
+
+### Step 1: Implement ChatPlatform
+
+```rust crates/magpie-slack/src/adapter.rs
+use std::sync::Arc;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use reqwest::Client;
+use magpie_core::ChatPlatform;
+
+pub struct SlackPlatform {
+    client: Client,
+    token: String,
+}
+
+impl SlackPlatform {
+    pub fn new(token: String) -> Self {
+        Self {
+            client: Client::new(),
+            token,
+        }
+    }
+}
+
+#[async_trait]
+impl ChatPlatform for SlackPlatform {
+    fn name(&self) -> &str {
+        "slack"
+    }
+
+    async fn fetch_history(&self, channel_id: &str) -> Result<String> {
+        // Fetch last 50 messages from channel
+        let resp = self.client
+            .get("https://slack.com/api/conversations.history")
+            .query(&[("channel", channel_id), ("limit", "50")])
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("failed to fetch Slack history")?;
+        
+        if !resp.status().is_success() {
+            anyhow::bail!("Slack API error: {}", resp.status());
+        }
+        
+        let data: serde_json::Value = resp.json().await?;
+        let messages = data["messages"].as_array()
+            .context("missing messages array")?;
+        
+        let mut history = Vec::new();
+        for msg in messages.iter().rev() {  // Reverse to chronological order
+            if let (Some(user), Some(text)) = (msg["user"].as_str(), msg["text"].as_str()) {
+                history.push(format!("{}: {}", user, text));
+            }
+        }
+        
+        Ok(history.join("\n"))
+    }
+
+    async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
+        let resp = self.client
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "channel": channel_id,
+                "text": text,
+            }))
+            .send()
+            .await
+            .context("failed to send Slack message")?;
+        
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Slack send_message failed: {}", text);
+        }
+        
+        Ok(())
+    }
+
+    // close_thread: use default no-op (Slack threads don't need closing)
+}
+```
+
+### Step 2: Event Handling
+
+```rust crates/magpie-slack/src/events.rs
+use std::sync::Arc;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::Json;
+use serde::Deserialize;
+use tracing::{info, warn, error};
+use magpie_core::run_pipeline;
+use crate::adapter::SlackPlatform;
+
+pub struct AppState {
+    pub token: String,
+    pub config: Arc<magpie_core::PipelineConfig>,
+}
+
+#[derive(Deserialize)]
+pub struct SlackEvent {
+    #[serde(rename = "type")]
+    pub type_field: String,
+    pub challenge: Option<String>,  // For URL verification
+    pub event: Option<Event>,
+}
+
+#[derive(Deserialize)]
+pub struct Event {
+    #[serde(rename = "type")]
+    pub type_field: String,
+    pub text: Option<String>,
+    pub user: Option<String>,
+    pub channel: Option<String>,
+    pub bot_id: Option<String>,  // Ignore bot messages
+}
+
+pub async fn handle_event(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SlackEvent>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Handle URL verification challenge
+    if payload.type_field == "url_verification" {
+        if let Some(challenge) = payload.challenge {
+            return Ok(Json(serde_json::json!({ "challenge": challenge })));
+        }
+    }
+    
+    // Handle message events
+    if payload.type_field == "event_callback" {
+        if let Some(event) = payload.event {
+            if event.type_field == "app_mention" || event.type_field == "message" {
+                // Ignore bot messages
+                if event.bot_id.is_some() {
+                    return Ok(Json(serde_json::json!({})));
+                }
+                
+                let text = match event.text {
+                    Some(t) if !t.trim().is_empty() => t,
+                    _ => return Ok(Json(serde_json::json!({}))),
+                };
+                
+                let task = strip_mention(&text);  // Remove @bot mention
+                if task.is_empty() {
+                    return Ok(Json(serde_json::json!({})));
+                }
+                
+                let user = event.user.unwrap_or_else(|| "unknown".to_string());
+                let channel = event.channel.unwrap_or_default();
+                
+                info!(user = %user, task = %task, "received Slack message");
+                
+                // Spawn pipeline in background
+                let token = state.token.clone();
+                let config = Arc::clone(&state.config);
+                
+                tokio::spawn(async move {
+                    let platform = SlackPlatform::new(token);
+                    
+                    // Send acknowledgment
+                    if let Err(e) = platform.send_message(&channel, "⏳ Working on it...").await {
+                        error!("failed to send ack: {e}");
+                    }
+                    
+                    // Run pipeline
+                    let reply = match run_pipeline(&platform, &channel, &user, &task, &config).await {
+                        Ok(result) => {
+                            info!(status = ?result.status, pr = ?result.pr_url, "pipeline complete");
+                            format_result(&result)
+                        }
+                        Err(e) => {
+                            error!("pipeline error: {e}");
+                            format!("❌ Pipeline failed: {e}")
+                        }
+                    };
+                    
+                    // Send result
+                    if let Err(e) = platform.send_message(&channel, &reply).await {
+                        error!("failed to send result: {e}");
+                    }
+                });
+            }
+        }
+    }
+    
+    Ok(Json(serde_json::json!({})))
+}
+
+fn strip_mention(text: &str) -> String {
+    // Strip <@U123456> mentions
+    let re = regex::Regex::new(r"<@[A-Z0-9]+>").unwrap();
+    re.replace_all(text, "").trim().to_string()
+}
+
+fn format_result(result: &magpie_core::PipelineResult) -> String {
+    let mut msg = String::new();
+    
+    match result.status {
+        magpie_core::PipelineStatus::Success => {
+            msg.push_str("✅ *Pipeline succeeded*\n\n");
+        }
+        magpie_core::PipelineStatus::PartialSuccess => {
+            msg.push_str("⚠️ *Partial success* (agent completed, CI failed)\n\n");
+        }
+        _ => {
+            msg.push_str("❌ *Pipeline failed*\n\n");
+        }
+    }
+    
+    if let Some(pr_url) = &result.pr_url {
+        msg.push_str(&format!("📝 Pull Request: {}\n", pr_url));
+    }
+    
+    msg.push_str(&format!("🔄 CI Rounds: {}\n", result.rounds_used));
+    msg.push_str(&format!("✅ Tests: {}\n", if result.ci_passed { "passed" } else { "failed" }));
+    
+    msg
+}
+```
+
+### Step 3: Main Entry Point
+
+```rust crates/magpie-slack/src/main.rs
+mod adapter;
+mod events;
+
+use std::sync::Arc;
+use anyhow::{Context, Result};
+use axum::routing::post;
+use axum::Router;
+use tracing_subscriber::EnvFilter;
+use events::AppState;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    
+    let token = std::env::var("SLACK_BOT_TOKEN")
+        .context("SLACK_BOT_TOKEN env var not set")?;
+    
+    let listen_addr = std::env::var("SLACK_LISTEN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:3000".into());
+    
+    let config = Arc::new(build_pipeline_config());
+    let state = Arc::new(AppState { token, config });
+    
+    let app = Router::new()
+        .route("/slack/events", post(events::handle_event))
+        .with_state(state);
+    
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    tracing::info!("magpie-slack listening on {listen_addr}");
+    axum::serve(listener, app).await?;
+    
+    Ok(())
+}
+
+fn build_pipeline_config() -> magpie_core::PipelineConfig {
+    use magpie_core::{PipelineConfig, PlaneConfig};
+    use std::path::PathBuf;
+    
+    let plane = match (
+        std::env::var("PLANE_BASE_URL"),
+        std::env::var("PLANE_API_KEY"),
+        std::env::var("PLANE_WORKSPACE_SLUG"),
+        std::env::var("PLANE_PROJECT_ID"),
+    ) {
+        (Ok(base_url), Ok(api_key), Ok(workspace_slug), Ok(project_id)) => {
+            Some(PlaneConfig { base_url, api_key, workspace_slug, project_id })
+        }
+        _ => None,
+    };
+    
+    PipelineConfig {
+        repo_dir: std::env::var("MAGPIE_REPO_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".")),
+        base_branch: std::env::var("MAGPIE_BASE_BRANCH")
+            .unwrap_or_else(|_| "main".to_string()),
+        test_command: std::env::var("MAGPIE_TEST_CMD")
+            .unwrap_or_else(|_| "cargo test".to_string()),
+        lint_command: std::env::var("MAGPIE_LINT_CMD")
+            .unwrap_or_else(|_| "cargo clippy".to_string()),
+        max_ci_rounds: std::env::var("MAGPIE_MAX_CI_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+        plane,
+        dry_run: false,
+        github_org: std::env::var("MAGPIE_GITHUB_ORG").ok(),
+        trace_dir: None,
+        daytona: None,
+        #[cfg(feature = "daytona")]
+        pool: None,
+    }
+}
+```
+
+### Step 4: Configuration
+
+```bash .env
+# Slack credentials
+SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+SLACK_LISTEN_ADDR=0.0.0.0:3000
+
+# Magpie configuration
+MAGPIE_REPO_DIR=/workspace/myproject
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="npm test"
+MAGPIE_LINT_CMD="npm run lint"
+MAGPIE_MAX_CI_ROUNDS=2
+
+# Optional: GitHub org
+MAGPIE_GITHUB_ORG=my-org
+
+# Optional: Plane integration
+PLANE_BASE_URL=https://plane.example.com
+PLANE_API_KEY=your_api_key
+PLANE_WORKSPACE_SLUG=engineering
+PLANE_PROJECT_ID=proj_123
+```
+
+### Step 5: Run & Test
+
+```bash
+# Build
+cargo build --release -p magpie-slack
+
+# Run locally
+cargo run -p magpie-slack
+
+# Expose with ngrok for Slack webhook
+ngrok http 3000
+# Configure Event Subscriptions in Slack app settings:
+# Request URL: https://abc123.ngrok.io/slack/events
+# Subscribe to: app_mention, message.channels
+```
+
+## Common Patterns
+
+### Webhook Signature Validation
+
+Most platforms sign webhook payloads for security:
+
+```rust
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub fn validate_signature(body: &[u8], signature: &str, secret: &str) -> bool {
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    
+    let expected = hex::encode(mac.finalize().into_bytes());
+    signature == expected
+}
+```
+
+### OAuth Token Management
+
+Cache tokens with expiry handling:
+
+```rust
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+pub struct TokenCache {
+    token: String,
+    expires_at: Instant,
+}
+
+pub struct AuthManager {
+    client_id: String,
+    client_secret: String,
+    cache: Arc<Mutex<Option<TokenCache>>>,
+}
+
+impl AuthManager {
+    pub async fn get_token(&self) -> Result<String> {
+        let mut cache = self.cache.lock().await;
+        
+        if let Some(ref cached) = *cache {
+            if Instant::now() < cached.expires_at {
+                return Ok(cached.token.clone());
+            }
+        }
+        
+        // Fetch new token from OAuth endpoint
+        let resp = reqwest::Client::new()
+            .post("https://oauth.example.com/token")
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", &self.client_id),
+                ("client_secret", &self.client_secret),
+            ])
+            .send()
+            .await?;
+        
+        let data: serde_json::Value = resp.json().await?;
+        let token = data["access_token"].as_str().unwrap().to_string();
+        let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
+        
+        let expires_at = Instant::now() + Duration::from_secs(expires_in) - Duration::from_secs(300);
+        *cache = Some(TokenCache { token: token.clone(), expires_at });
+        
+        Ok(token)
+    }
+}
+```
+
+### Mention Stripping
+
+Each platform has unique mention syntax:
+
+<CodeGroup>
+```rust Discord
+pub fn strip_discord_mention(content: &str, bot_id: u64) -> String {
+    let patterns = [format!("<@{bot_id}>"), format!("<@!{bot_id}>")];
+    let mut result = content.to_string();
+    for pattern in &patterns {
+        result = result.replace(pattern, "");
+    }
+    result.trim().to_string()
+}
+```
+
+```rust Teams
+pub fn strip_teams_mention(text: &str) -> String {
+    let mut result = text.to_string();
+    while let Some(start) = result.find("<at>") {
+        if let Some(end) = result[start..].find("</at>") {
+            let remove_end = start + end + "</at>".len();
+            result = format!("{}{}", &result[..start], &result[remove_end..]);
+        } else {
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+```
+
+```rust Slack
+pub fn strip_slack_mention(text: &str) -> String {
+    let re = regex::Regex::new(r"<@[A-Z0-9]+>").unwrap();
+    re.replace_all(text, "").trim().to_string()
+}
+```
+</CodeGroup>
+
+### Error Handling
+
+Use `anyhow` for flexible error propagation:
+
+```rust
+use anyhow::{Context, Result, bail};
+
+async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
+    let resp = self.client
+        .post(&format!("https://api.example.com/channels/{}/messages", channel_id))
+        .bearer_auth(&self.token)
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .context("failed to send HTTP request")?;  // Add context
+    
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("API error ({status}): {body}");  // Early return with details
+    }
+    
+    Ok(())
+}
+```
+
+## Testing Your Adapter
+
+### Unit Tests with Mock Responses
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    
+    #[tokio::test]
+    async fn test_send_message_success() {
+        let server = MockServer::start().await;
+        
+        Mock::given(method("POST"))
+            .and(path("/channels/C123/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "id": "msg_1" })
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        
+        let platform = MyPlatform::with_base_url(server.uri(), "token".into());
+        let result = platform.send_message("C123", "Hello").await;
+        
+        assert!(result.is_ok());
+    }
+}
+```
+
+### Integration Tests
+
+```rust
+#[tokio::test]
+#[ignore]  // Requires real credentials
+async fn test_slack_integration() {
+    dotenvy::dotenv().ok();
+    let token = std::env::var("SLACK_BOT_TOKEN").unwrap();
+    let platform = SlackPlatform::new(token);
+    
+    // Send test message
+    platform.send_message("C123456", "Test message from integration test").await.unwrap();
+    
+    // Fetch history
+    let history = platform.fetch_history("C123456").await.unwrap();
+    assert!(history.contains("Test message"));
+}
+```
+
+## Deployment
+
+### Docker
+
+```dockerfile
+FROM rust:1.75 as builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p magpie-slack
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates git && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/magpie-slack /usr/local/bin/
+EXPOSE 3000
+CMD ["magpie-slack"]
+```
+
+### Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: magpie-slack
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: magpie-slack
+  template:
+    metadata:
+      labels:
+        app: magpie-slack
+    spec:
+      containers:
+      - name: magpie
+        image: your-registry/magpie-slack:latest
+        ports:
+        - containerPort: 3000
+        envFrom:
+        - secretRef:
+            name: magpie-slack-secrets
+```
+
+## Real-World Examples
+
+The Magpie codebase includes three production adapters you can reference:
+
+<CardGroup cols={3}>
+  <Card title="Discord" icon="discord" href="https://github.com/your-org/magpie/tree/main/crates/magpie-discord">
+    Full Discord bot with Serenity, thread management, mention stripping
+  </Card>
+  
+  <Card title="Teams" icon="microsoft" href="https://github.com/your-org/magpie/tree/main/crates/magpie-teams">
+    Azure Bot Framework webhook, OAuth2 token caching, HMAC validation
+  </Card>
+  
+  <Card title="CLI" icon="terminal" href="https://github.com/your-org/magpie/tree/main/crates/magpie-cli">
+    Minimal adapter for local testing, demonstrates no-op implementations
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Core Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand Magpie's pipeline orchestration and agent system
+  </Card>
+  
+  <Card title="Blueprint Engine" icon="code-branch" href="/api/blueprint-engine">
+    Learn how blueprints orchestrate multi-step workflows
+  </Card>
+  
+  <Card title="Environment Variables" icon="gear" href="/configuration/environment">
+    Complete reference for all configuration options
+  </Card>
+  
+  <Card title="Contributing" icon="github" href="/guides/contributing">
+    Submit your adapter to the Magpie repository
+  </Card>
+</CardGroup>

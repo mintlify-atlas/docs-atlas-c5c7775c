@@ -1,0 +1,374 @@
+---
+title: Contributing to Magpie
+description: Guide for contributors - setup, workflow, and conventions
+---
+
+## Overview
+
+Thanks for your interest in contributing to Magpie! This guide will help you get started with the codebase, understand the architecture, and make your first contribution.
+
+## Prerequisites
+
+Before you begin, ensure you have:
+
+- **Rust 1.75+** — Install via [rustup](https://rustup.rs/)
+- **Claude CLI** — Required for both Tier 1 (text generation) and Tier 2 (Goose agent). See [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code) for setup
+- **Git** and **GitHub CLI** (`gh`) — For version control, PR workflow, and repo cloning
+
+## Getting Started
+
+### 1. Fork and Clone
+
+```bash
+git clone https://github.com/<your-username>/magpie.git
+cd magpie
+```
+
+### 2. Set Up Environment
+
+Copy from `.env.example` or set manually:
+
+```bash
+export MAGPIE_REPO_DIR="$(pwd)"
+export MAGPIE_BASE_BRANCH="main"
+export MAGPIE_TEST_CMD="cargo test"
+export MAGPIE_LINT_CMD="cargo clippy"
+```
+
+### 3. Build the Project
+
+```bash
+cargo build
+```
+
+<Note>
+First build takes ~4-5 minutes due to Goose transitive dependencies (candle, llama-cpp, tree-sitter). Subsequent builds are much faster.
+</Note>
+
+### 4. Run Tests
+
+```bash
+cargo test
+```
+
+### 5. Check Formatting and Lints
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+```
+
+## Project Structure
+
+```
+crates/
+  magpie-core/       # Library — agent, pipeline, blueprint engine, repo, tracing
+  magpie-cli/        # Binary — CLI entry point for local usage
+  magpie-discord/    # Binary — Discord bot adapter
+  magpie-teams/      # Binary — Microsoft Teams webhook adapter
+```
+
+**Most contributions will land in `magpie-core`**, which is the main library. The adapter crates (`magpie-cli`, `magpie-discord`, `magpie-teams`) are thin wrappers that implement the `ChatPlatform` trait.
+
+### Key Modules in magpie-core
+
+| Module | Purpose |
+|---|---|
+| `pipeline.rs` | Full pipeline orchestrator — classify task, choose blueprint, CI loop, PR, Plane |
+| `agent.rs` | `MagpieAgent` wrapper around Goose's agent loop (Tier 2) |
+| `blueprint/` | Blueprint engine — step definitions, runner, shell/agent step kinds |
+| `git.rs` | `GitOps` helper for branch, commit, push, PR operations |
+| `plane.rs` | `PlaneClient` for self-hosted Plane issue tracking |
+| `platform.rs` | `ChatPlatform` trait — the adapter interface |
+| `repo.rs` | Org-scoped dynamic repo resolution |
+| `trace.rs` | Observability — `TraceBuilder`, `AgentCallTrace`, JSONL output |
+| `sandbox/` | Sandbox abstraction — local, mock, Daytona implementations |
+
+## Two-Tier Architecture
+
+Understanding the two-tier architecture is critical for contributing:
+
+### Tier 1: `claude_call` (pipeline.rs)
+
+- Direct `claude -p` CLI call for clean, single-response text
+- Used for: branch slugs, task classification, commit messages
+- **When to use**: Steps that need simple text output (summarization, classification)
+
+### Tier 2: `MagpieAgent` (agent.rs)
+
+- Full Goose agent loop with streaming and tool access
+- Used for: actual coding work (file edits, test writing, implementation)
+- **When to use**: Steps that need file/shell tool access
+
+<Tip>
+When adding new pipeline steps:
+- Simple text → Tier 1 (`claude_call()` in `pipeline.rs`)
+- File/shell access → Tier 2 (add `AgentStep` to a blueprint)
+- Deterministic → `ShellStep`
+</Tip>
+
+## Coding Conventions
+
+### Error Handling
+
+```rust
+use anyhow::{Context, Result, bail};
+
+// Use anyhow::Result everywhere
+pub async fn do_something() -> Result<String> {
+    // Add context to errors
+    let data = fetch_data()
+        .await
+        .context("failed to fetch data")?;
+    
+    // Early returns with bail!
+    if data.is_empty() {
+        bail!("data cannot be empty");
+    }
+    
+    Ok(data)
+}
+```
+
+**Rules**:
+- Use `anyhow::Result<T>` everywhere
+- Use `.context("description")?` to add error context
+- Use `bail!()` for early returns with custom errors
+- **Never** `unwrap()` in library code — only in tests or after guaranteed checks
+
+### Async Code
+
+```rust
+use async_trait::async_trait;
+use std::sync::Arc;
+
+#[async_trait]
+trait MyTrait {
+    async fn do_work(&self) -> Result<()>;
+}
+
+// Shared ownership: Arc::clone, not .clone()
+let shared = Arc::new(data);
+let cloned = Arc::clone(&shared); // ✓ Preferred
+let cloned = shared.clone();       // ✗ Avoid
+```
+
+**Rules**:
+- Runtime: `tokio`
+- All async traits use `#[async_trait]`
+- Shared ownership: `Arc::clone(&x)` (not `x.clone()`)
+
+### Logging
+
+```rust
+use tracing::{info, warn, error};
+
+// Structured logging with tracing
+info!(step_name = "test", "Starting test execution");
+warn!(exit_code = 1, "Test failed");
+error!(error = %e, "Pipeline failed");
+
+// Never println! in library code
+// println!("message"); // ✗ Don't do this
+```
+
+**Rules**:
+- Use `tracing` macros: `info!()`, `warn!()`, `error!()` with structured fields
+- **Never** `println!()` in library code (only in CLI `main.rs`)
+
+### Types & Style
+
+```rust
+// Derive Debug, Clone on most structs
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub repo_dir: PathBuf,
+    pub branch: String,
+}
+
+// Add Serialize, Deserialize for types that cross boundaries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineResult {
+    pub status: PipelineStatus,
+    pub pr_url: Option<String>,
+}
+
+// Builder pattern with with_* methods
+impl Config {
+    pub fn new() -> Self { ... }
+    
+    pub fn with_branch(mut self, branch: String) -> Self {
+        self.branch = branch;
+        self
+    }
+}
+```
+
+**Rules**:
+- Derive `Debug, Clone` on most structs
+- Add `Serialize, Deserialize` for types that cross boundaries (API responses, config files)
+- Builder pattern: `with_*` methods that return `Self`
+- Default `rustfmt` — run `cargo fmt` before committing
+- `cargo clippy -- -D warnings` (all warnings are errors)
+
+### Configuration
+
+```rust
+use anyhow::{Context, Result};
+use dotenvy;
+
+// Load .env at startup
+dotenvy::dotenv().ok();
+
+// Required env vars
+let api_key = std::env::var("API_KEY")
+    .context("API_KEY not set")?;
+
+// Optional env vars
+let branch = std::env::var("BRANCH")
+    .unwrap_or_else(|_| "main".to_string());
+
+let optional = std::env::var("OPTIONAL").ok();
+```
+
+## Making Changes
+
+### 1. Create a Branch
+
+```bash
+git checkout -b your-branch-name
+```
+
+### 2. Make Your Changes
+
+Keep commits focused and atomic. Follow the coding conventions above.
+
+### 3. Test Your Changes
+
+```bash
+# Format code
+cargo fmt
+
+# Run lints
+cargo clippy -- -D warnings
+
+# Run tests
+cargo test
+
+# Test specific crate
+cargo test -p magpie-core
+
+# Run ignored tests (requires external services)
+cargo test -- --ignored
+```
+
+### 4. Push and Create PR
+
+```bash
+git push origin your-branch-name
+```
+
+Then open a Pull Request against `main` on GitHub.
+
+## Pull Request Guidelines
+
+- **Keep PRs small and focused** — One logical change per PR is ideal
+- **Write a clear description** of what the PR does and why
+- **Link related issues** (e.g., Plane issues or GitHub issues) in the PR description
+- **All CI checks must pass** before merge
+- **Address review feedback** promptly
+
+## Common Patterns
+
+### Adding a New Pipeline Step
+
+1. **Simple text** → Tier 1 (`claude_call()` in `pipeline.rs`)
+2. **File/shell access** → Tier 2 (add `AgentStep` to a blueprint)
+3. **Deterministic** → `ShellStep`
+
+Example of adding a shell step to a blueprint:
+
+```rust
+use crate::blueprint::step::{Step, StepKind, Condition};
+use crate::blueprint::steps::ShellStep;
+
+let step = Step {
+    name: "run-tests".to_string(),
+    kind: StepKind::Shell(
+        ShellStep::new("cargo")
+            .with_args(vec!["test".to_string()])
+    ),
+    condition: Condition::Always,
+    continue_on_error: false,
+};
+```
+
+### Adding a New Chat Adapter
+
+1. Create new crate: `crates/magpie-<platform>/`
+2. Implement `ChatPlatform` trait (4 methods: `name`, `fetch_history`, `send_message`, `close_thread`)
+3. Build `PipelineConfig` from env vars
+4. Call `run_pipeline()` with your platform implementation
+
+See `crates/magpie-discord/src/handler.rs` for a complete example.
+
+### Adding a New Sandbox Type
+
+1. Implement `trait Sandbox` in `sandbox/mod.rs`:
+   - `name()` — sandbox type identifier
+   - `working_dir()` — current working directory
+   - `exec()` — execute command
+   - `read_file()` — read file contents
+   - `write_file()` — write file contents
+   - `destroy()` — cleanup resources
+
+2. Wire into `pipeline.rs` sandbox creation logic
+
+See `sandbox/mock.rs` for a simple example.
+
+## Running Specific Adapters
+
+### CLI (no external services needed)
+
+```bash
+# Single prompt
+cargo run -p magpie-cli -- "your prompt here"
+
+# Blueprint engine demo
+cargo run -p magpie-cli -- --demo
+
+# Full pipeline
+cargo run -p magpie-cli -- --pipeline "add a health check"
+
+# With tracing
+cargo run -p magpie-cli -- --trace --pipeline "fix the bug"
+```
+
+### Discord Bot
+
+```bash
+DISCORD_TOKEN="your-token" cargo run -p magpie-discord
+```
+
+### Teams Webhook
+
+```bash
+TEAMS_APP_ID="id" TEAMS_APP_SECRET="secret" cargo run -p magpie-teams
+```
+
+The webhook listens on `TEAMS_LISTEN_ADDR` (default `0.0.0.0:3978`):
+- `POST /api/messages` — Bot Framework webhook
+- `GET /health` — health check
+
+## Reporting Issues
+
+If you find a bug or have a feature request, open a GitHub issue with:
+
+- A clear title and description
+- Steps to reproduce (for bugs)
+- Expected vs. actual behavior
+- Relevant logs or error messages
+
+## Questions?
+
+Feel free to open an issue or reach out in the project chat. We're happy to help!

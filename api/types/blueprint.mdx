@@ -1,0 +1,479 @@
+---
+title: "Blueprint"
+description: "Deterministic orchestration of Shell and Agent steps"
+---
+
+## Overview
+
+A `Blueprint` is a named sequence of `Step`s that the `BlueprintRunner` executes sequentially. Each step can be a shell command or an agent prompt, with conditions that control whether it runs.
+
+Blueprints are Magpie's answer to the problem of fragmented, non-deterministic agent behavior. Instead of a single "do everything" prompt, tasks are broken into discrete phases with explicit control flow.
+
+Defined in `crates/magpie-core/src/blueprint/runner.rs:8-26`.
+
+## Core Types
+
+### Blueprint
+
+```rust
+pub struct Blueprint {
+    pub name: String,
+    pub steps: Vec<Step>,
+}
+```
+
+<ResponseField name="name" type="String" required>
+  Human-readable identifier for the blueprint (e.g. `"magpie-tdd"`, `"magpie-diagnostic"`, `"magpie-fix"`).
+</ResponseField>
+
+<ResponseField name="steps" type="Vec<Step>" required>
+  Ordered sequence of steps to execute. Steps run sequentially; each step receives the context output from the previous step.
+</ResponseField>
+
+### Step
+
+Defined in `crates/magpie-core/src/blueprint/step.rs:56-62`.
+
+```rust
+pub struct Step {
+    pub name: String,
+    pub kind: StepKind,
+    pub condition: Condition,
+    pub continue_on_error: bool,
+}
+```
+
+<ResponseField name="name" type="String" required>
+  Step identifier for logging and tracing (e.g. `"scan-repo"`, `"plan"`, `"implement"`).
+</ResponseField>
+
+<ResponseField name="kind" type="StepKind" required>
+  What the step does. See [StepKind](#stepkind).
+</ResponseField>
+
+<ResponseField name="condition" type="Condition" required>
+  When to run the step. See [Condition](#condition).
+</ResponseField>
+
+<ResponseField name="continue_on_error" type="bool" required>
+  If `true`, a failed step (non-zero exit code or error) doesn't stop the blueprint. If `false`, the blueprint fails immediately.
+  
+  **Default:** `false` (fail fast)
+  
+  **Common Use:** Set to `true` for test steps in TDD flow (tests are *expected* to fail in the red phase).
+</ResponseField>
+
+### StepKind
+
+Defined in `crates/magpie-core/src/blueprint/step.rs:49-53`.
+
+```rust
+pub enum StepKind {
+    Shell(ShellStep),
+    Agent(AgentStep),
+}
+```
+
+<ResponseField name="Shell" type="enum variant">
+  Runs a shell command via the sandbox. See [ShellStep](#shellstep).
+</ResponseField>
+
+<ResponseField name="Agent" type="enum variant">
+  Runs an AI agent (Tier 2: MagpieAgent with full tool access). See [AgentStep](#agentstep).
+</ResponseField>
+
+### Condition
+
+Defined in `crates/magpie-core/src/blueprint/step.rs:24-46`.
+
+```rust
+pub enum Condition {
+    Always,
+    IfExitCode(i32),
+    IfExitCodeNot(i32),
+    IfOutputContains(String),
+}
+```
+
+<ResponseField name="Always" type="enum variant">
+  Step always runs.
+</ResponseField>
+
+<ResponseField name="IfExitCode(i32)" type="enum variant">
+  Step runs only if the previous step's exit code matches the given value.
+  
+  **Example:** `IfExitCode(0)` → run only if previous step succeeded.
+</ResponseField>
+
+<ResponseField name="IfExitCodeNot(i32)" type="enum variant">
+  Step runs only if the previous step's exit code does NOT match the given value.
+  
+  **Example:** `IfExitCodeNot(0)` → run only if previous step failed.
+</ResponseField>
+
+<ResponseField name="IfOutputContains(String)" type="enum variant">
+  Step runs only if the previous step's output (stdout + stderr) contains the given substring.
+  
+  **Example:** `IfOutputContains("error:")` → run only if previous output had an error message.
+</ResponseField>
+
+### StepContext
+
+Defined in `crates/magpie-core/src/blueprint/step.rs:4-22`.
+
+```rust
+pub struct StepContext {
+    pub working_dir: PathBuf,
+    pub last_output: Option<String>,
+    pub last_exit_code: Option<i32>,
+    pub metadata: HashMap<String, String>,
+}
+```
+
+<ResponseField name="working_dir" type="PathBuf" required>
+  Current working directory for step execution. Set once at blueprint start, doesn't change between steps.
+</ResponseField>
+
+<ResponseField name="last_output" type="Option<String>">
+  Combined stdout + stderr from the previous step. `None` at blueprint start.
+</ResponseField>
+
+<ResponseField name="last_exit_code" type="Option<i32>">
+  Exit code from the previous step. `None` at blueprint start. Always `Some(0)` for agent steps (agents don't fail with exit codes, they error).
+</ResponseField>
+
+<ResponseField name="metadata" type="HashMap<String, String>" required>
+  Key-value store for passing custom data between steps. The pipeline uses this for:
+  - `"chat_history"` — conversation history from Discord/Teams (injected via `TriggerContext`)
+  - `"trace_dir"` — path to JSONL trace directory (injected by pipeline)
+  
+  **Usage:** `AgentStep` can reference metadata with `with_context_from_metadata(key)`.
+</ResponseField>
+
+## ShellStep
+
+Defined in `crates/magpie-core/src/blueprint/steps/shell.rs:7-37`.
+
+```rust
+pub struct ShellStep {
+    pub command: String,
+    pub args: Vec<String>,
+}
+```
+
+<ResponseField name="command" type="String" required>
+  Shell command to execute (e.g. `"echo"`, `"cargo"`, `"ls"`).
+</ResponseField>
+
+<ResponseField name="args" type="Vec<String>" required>
+  Arguments to pass to the command. Empty by default.
+</ResponseField>
+
+### Builder API
+
+```rust
+ShellStep::new("cargo")
+    .with_args(vec!["test".to_string(), "--workspace".to_string()])
+```
+
+### Execution
+
+Calls `sandbox.exec(command, args)` and captures:
+- Exit code → `StepContext.last_exit_code`
+- Stdout + stderr combined → `StepContext.last_output`
+
+## AgentStep
+
+Defined in `crates/magpie-core/src/blueprint/steps/agent.rs:10-120`.
+
+```rust
+pub struct AgentStep {
+    pub prompt: String,
+    pub max_turns: Option<u32>,
+    pub include_last_output: bool,
+    pub context_metadata_key: Option<String>,
+    pub step_name: Option<String>,
+}
+```
+
+<ResponseField name="prompt" type="String" required>
+  The agent's task prompt. This is the base instruction; additional context can be prepended via builder methods.
+</ResponseField>
+
+<ResponseField name="max_turns" type="Option<u32>">
+  Maximum number of agent turns (tool calls). Defaults to 10 if not set.
+</ResponseField>
+
+<ResponseField name="include_last_output" type="bool" required>
+  If `true`, prepends the previous step's output to the prompt with `"Previous step output:\n```\n...\n```\n\n"`.
+  
+  **Default:** `false`
+</ResponseField>
+
+<ResponseField name="context_metadata_key" type="Option<String>">
+  If set, prepends the value of `StepContext.metadata[key]` to the prompt with `"Context from conversation:\n```\n...\n```\n\n"`.
+  
+  **Common Use:** `"chat_history"` — includes full Discord/Teams conversation so the agent has context.
+</ResponseField>
+
+<ResponseField name="step_name" type="Option<String>">
+  Internal field set by the runner for trace logging. Not used by user code.
+</ResponseField>
+
+### Builder API
+
+```rust
+AgentStep::new("Implement the health check endpoint")
+    .with_max_turns(20)
+    .with_last_output()  // include previous step's output
+    .with_context_from_metadata("chat_history")  // include conversation history
+```
+
+### Execution
+
+**Local Sandbox (default):**
+- Runs `MagpieAgent` (Goose-based, Tier 2 LLM) with full file/shell tool access
+- Writes JSONL trace if `trace_dir` is in metadata
+- Returns agent's final response as `StepContext.last_output`
+- Always sets `last_exit_code = Some(0)` (agents don't return exit codes)
+
+**Daytona Sandbox (remote):**
+- Executes `claude -p <prompt> --max-turns <n>` inside the remote sandbox via REST API
+- Returns stdout as `last_output`
+- Fails if exit code != 0
+
+## BlueprintRunner
+
+Defined in `crates/magpie-core/src/blueprint/runner.rs:28-106`.
+
+```rust
+pub struct BlueprintRunner<'a> {
+    context: StepContext,
+    sandbox: &'a dyn Sandbox,
+}
+
+impl<'a> BlueprintRunner<'a> {
+    pub fn new(context: StepContext, sandbox: &'a dyn Sandbox) -> Self;
+    pub async fn run(mut self, blueprint: &Blueprint) -> Result<StepContext>;
+}
+```
+
+### Execution Flow
+
+For each step in `blueprint.steps`:
+
+1. **Evaluate Condition:** If `step.condition.evaluate(&context)` returns `false`, skip the step.
+2. **Execute Step:** Call `step.kind.execute()` (dispatches to `ShellStep` or `AgentStep`).
+3. **Handle Result:**
+   - **Success:** Update `self.context` with new output/exit code, continue to next step.
+   - **Non-Zero Exit:** If `continue_on_error` is `false`, fail the blueprint. If `true`, log warning and continue with previous context.
+   - **Error (exception):** If `continue_on_error` is `false`, return error. If `true`, log warning and continue.
+4. **Return Final Context:** After all steps, return the final `StepContext`.
+
+### Logging
+
+Runner logs every step:
+
+```text
+[1/7] scan-repo (shell) → running...
+[1/7] scan-repo → OK (exit 0)
+[2/7] plan (agent) → running...
+[2/7] plan → OK
+[3/7] write-tests (agent) → running...
+[3/7] write-tests → OK
+[4/7] verify-tests-fail (shell) → running...
+[4/7] verify-tests-fail → exit 101 (continuing)
+...
+```
+
+## Built-in Blueprints
+
+Magpie has three built-in blueprints, selected by [TaskComplexity](/api/types/task-complexity).
+
+### Simple Blueprint
+
+**Function:** `build_main_blueprint()` in `pipeline.rs:251-293`.
+
+**Use Case:** Docs, typos, trivial edits.
+
+**Steps:**
+1. `validate-workspace` (Shell: `pwd`) — sanity check
+2. `execute-task` (Agent: single prompt with chat history)
+
+**No CI integration** — tests/lint run separately in the pipeline's CI loop.
+
+### TDD Blueprint
+
+**Function:** `build_tdd_blueprint()` in `pipeline.rs:348-513`.
+
+**Use Case:** New features, refactors.
+
+**Steps:**
+1. `scan-repo` (Shell: `find` + exclusions) → get file tree
+2. `plan` (Agent: read tree, create plan) → concise implementation strategy
+3. `write-tests` (Agent: write test code ONLY, no implementation) → TDD red phase
+4. `verify-tests-fail` (Shell: run tests, `continue_on_error: true`) → expect failure
+5. `implement` (Agent: read test output, implement feature) → TDD green phase
+6. `run-tests` (Shell: run tests, `continue_on_error: true`) → verify green
+7. `lint-check` (Shell: run linter, `continue_on_error: true`)
+
+**CI Optimization:** If step 6+7 pass (exit 0), the pipeline skips the external CI loop.
+
+### Diagnostic Blueprint
+
+**Function:** `build_diagnostic_blueprint()` in `pipeline.rs:520-724`.
+
+**Use Case:** Bug fixes, regressions.
+
+**Steps:**
+1. `scan-repo` (Shell: `find` + exclusions)
+2. `investigate` (Agent: **read-only**, trace root cause, NO file modifications)
+3. `plan` (Agent: create targeted fix plan based on investigation)
+4. `write-regression-test` (Agent: write test that reproduces the bug)
+5. `verify-test-fails` (Shell: run tests, expect failure)
+6. `implement-fix` (Agent: fix the root cause)
+7. `run-tests` (Shell: run all tests)
+8. `lint-check` (Shell: run linter)
+
+**Key Difference:** Step 2 (investigate) forces the agent to analyze the bug *without* modifying files. This prevents premature fixes and encourages root-cause analysis.
+
+### Fix Blueprint
+
+**Function:** `build_fix_blueprint()` in `pipeline.rs:298-342`.
+
+**Use Case:** Retry after CI failure.
+
+**Steps:**
+1. `agent-fix` (Agent: receives test failure output, fixes issues)
+
+**Context:** This blueprint is called inside the pipeline's CI loop when tests fail. The agent gets the full test output and is asked to fix the issues.
+
+## Usage Example
+
+### Custom Blueprint
+
+```rust
+use magpie_core::blueprint::{
+    Blueprint, Step, StepKind, Condition,
+    steps::{ShellStep, AgentStep},
+};
+
+let blueprint = Blueprint::new("my-custom-flow")
+    .add_step(Step {
+        name: "check-status".to_string(),
+        kind: StepKind::Shell(ShellStep::new("git").with_args(vec!["status".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: false,
+    })
+    .add_step(Step {
+        name: "analyze".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new("Summarize the git status from the previous step.")
+                .with_last_output()
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+```
+
+### Running a Blueprint
+
+```rust
+use magpie_core::blueprint::{
+    BlueprintRunner, step::StepContext,
+};
+use magpie_core::sandbox::LocalSandbox;
+use std::path::PathBuf;
+
+let sandbox = LocalSandbox::from_path(PathBuf::from("/path/to/repo"));
+let mut ctx = StepContext::new(PathBuf::from("/path/to/repo"));
+
+// Inject metadata
+ctx.metadata.insert("chat_history".to_string(), "User: fix the bug\nBot: investigating...".to_string());
+
+let runner = BlueprintRunner::new(ctx, &sandbox);
+let final_ctx = runner.run(&blueprint).await?;
+
+println!("Final output: {}", final_ctx.last_output.unwrap_or_default());
+println!("Final exit code: {:?}", final_ctx.last_exit_code);
+```
+
+### Conditional Execution
+
+```rust
+let blueprint = Blueprint::new("conditional-flow")
+    .add_step(Step {
+        name: "test".to_string(),
+        kind: StepKind::Shell(ShellStep::new("cargo").with_args(vec!["test".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: true,  // don't fail if tests fail
+    })
+    .add_step(Step {
+        name: "celebrate".to_string(),
+        kind: StepKind::Shell(ShellStep::new("echo").with_args(vec!["Tests passed!".to_string()])),
+        condition: Condition::IfExitCode(0),  // only if previous step succeeded
+        continue_on_error: false,
+    })
+    .add_step(Step {
+        name: "fix".to_string(),
+        kind: StepKind::Agent(AgentStep::new("Fix the test failures.")),
+        condition: Condition::IfExitCodeNot(0),  // only if previous step failed
+        continue_on_error: false,
+    });
+```
+
+## Design Rationale
+
+### Why Blueprints?
+
+Early versions of Magpie used a single "implement this task" prompt. Problems:
+- Agent would skip tests
+- Agent would over-optimize or under-optimize
+- No control flow for complex tasks (bugs vs features)
+
+Blueprints solve this by:
+- **Forcing phases** (plan → test → implement)
+- **Injecting context** (previous step output flows automatically)
+- **Enabling retries** (TDD verify-fail step can `continue_on_error`)
+- **Reducing prompt complexity** (each step has a focused, single-purpose prompt)
+
+### Why Sequential Execution?
+
+Steps run one at a time, not in parallel. This is intentional:
+- Each step depends on the previous step's output (e.g. "plan" needs file tree from "scan")
+- Agent steps are stateful (file modifications affect future steps)
+- Easier to debug (logs are chronological)
+
+### Why StepContext?
+
+Context is the "thread" that flows through the blueprint:
+- `last_output` lets the next step see what just happened
+- `last_exit_code` enables conditional execution
+- `metadata` lets the pipeline inject external data (chat history, trace config)
+
+### Why Two Step Kinds?
+
+**Shell:** Deterministic, fast, no LLM cost. Use for:
+- Scanning the repo
+- Running tests/lint
+- Verifying preconditions
+
+**Agent:** Non-deterministic, slow, expensive. Use for:
+- Planning
+- Writing code
+- Fixing bugs
+
+Blueprints compose both to create structured workflows.
+
+## Notes
+
+- **Not Turing Complete:** Blueprints are linear sequences with conditional skips. No loops, no jumps, no recursion.
+- **No Dynamic Steps:** All steps are defined at blueprint creation time. You can't add steps mid-execution.
+- **Error Handling:** Use `continue_on_error: true` for expected failures (e.g. TDD red phase). Use `false` for unexpected failures (e.g. agent crashes).
+- **Tracing:** Every agent step writes JSONL traces if `trace_dir` is in metadata.
+
+## See Also
+
+- [TaskComplexity](/api/types/task-complexity) — Determines which built-in blueprint to use
+- [PipelineConfig](/api/types/pipeline-config) — Configuration passed to blueprint builders
+- [PipelineResult](/api/types/pipeline-result) — Output after blueprint execution

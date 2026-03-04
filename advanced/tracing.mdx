@@ -1,0 +1,431 @@
+---
+title: 'Agent Call Tracing'
+description: 'JSONL trace files for debugging agent behavior'
+---
+
+## Overview
+
+Magpie writes **structured JSONL trace files** for every agent call in a pipeline run. Each trace captures:
+
+- Prompt preview (first 200 chars)
+- Streaming events (text, tool requests, tool responses, thinking, errors)
+- Response preview (first 500 chars)
+- Duration and tool call count
+- Elapsed time for each event
+
+Traces are written to `.magpie/traces/magpie-trace-YYYY-MM-DD.jsonl` and enable post-run analysis of agent behavior.
+
+## Configuration
+
+### Environment Variables
+
+<ParamField path="TRACE_DIR" type="string" optional>
+  Directory for trace files. Defaults to `.magpie/traces/` relative to the repo root.
+</ParamField>
+
+### CLI Flag
+
+Enable verbose trace output to stderr during pipeline execution:
+
+```bash
+cargo run -p magpie-cli -- --trace --pipeline "add health check"
+```
+
+With `--trace`, you'll see real-time output like:
+
+```
+[branch-slug] CALL: "Generate a short branch name slug for this task..." (truncated)
+[branch-slug] TEXT: add
+[branch-slug] TEXT: -health-check-endpoint
+[branch-slug] DONE: 1.2s, 0 tool calls
+[classify] CALL: "Classify this task as either SIMPLE, STANDARD, or BUGFIX..."
+[classify] TEXT: STANDARD
+[classify] DONE: 0.8s, 0 tool calls
+[execute-task] CALL: "You are planning how to implement a task..."
+[execute-task] TOOL_REQ: read_file { path: "src/main.rs" }
+[execute-task] TOOL_RES: <file contents>
+[execute-task] TEXT: I'll add a /health endpoint that returns 200 OK...
+[execute-task] DONE: 45.3s, 8 tool calls
+```
+
+## Trace Format
+
+### JSONL Structure
+
+Each trace is a single JSON line:
+
+<CodeGroup>
+```json Example Trace
+{
+  "started_at": 1704067200000,
+  "step_name": "execute-task",
+  "prompt_preview": "You are planning how to implement a task. The file tree of the repository is provided as previous step output.\n\nTask: add health check endpoint\n\nCreate a brief plan:",
+  "events": [
+    {
+      "kind": "text",
+      "content": "I'll add a /health endpoint",
+      "elapsed_ms": 1200
+    },
+    {
+      "kind": "tool_request",
+      "content": "read_file { path: \"src/main.rs\" }",
+      "elapsed_ms": 1250
+    },
+    {
+      "kind": "tool_response",
+      "content": "fn main() { ... }",
+      "elapsed_ms": 1350
+    }
+  ],
+  "response_preview": "I'll add a /health endpoint that returns 200 OK with JSON: { \"status\": \"ok\" }. The endpoint will be added to the existing Axum router in src/main.rs.",
+  "duration_ms": 45320,
+  "tool_call_count": 8
+}
+```
+</CodeGroup>
+
+### Event Kinds
+
+<ResponseField name="EventKind" type="enum">
+  <Expandable title="Variants">
+    <ResponseField name="text">
+      Agent's text output (streaming tokens buffered by line)
+    </ResponseField>
+    <ResponseField name="tool_request">
+      Agent requested a tool (e.g., `read_file`, `edit`, `bash`)
+    </ResponseField>
+    <ResponseField name="tool_response">
+      Tool execution result returned to agent
+    </ResponseField>
+    <ResponseField name="thinking">
+      Extended thinking blocks (Claude's `<thinking>` tags)
+    </ResponseField>
+    <ResponseField name="error">
+      Error from agent or tool execution
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Implementation
+
+### TraceBuilder
+
+The `TraceBuilder` accumulates events during an agent call:
+
+<CodeGroup>
+```rust trace.rs:72
+pub struct TraceBuilder {
+    step_name: String,
+    prompt_preview: String,
+    events: Vec<TraceEvent>,
+    tool_call_count: u32,
+    start: Instant,
+    started_at: u64,
+    /// Buffer for Text events — flushed on newlines or non-Text events.
+    text_buf: String,
+}
+
+impl TraceBuilder {
+    pub fn new(step_name: &str, prompt: &str) -> Self {
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let prompt_preview: String = prompt.chars().take(200).collect();
+
+        if is_trace_verbose() {
+            eprintln!("[{step_name}] CALL: {:?}", truncate(prompt, 120));
+        }
+
+        Self {
+            step_name: step_name.to_string(),
+            prompt_preview,
+            events: Vec::new(),
+            tool_call_count: 0,
+            start: Instant::now(),
+            started_at,
+            text_buf: String::new(),
+        }
+    }
+}
+```
+</CodeGroup>
+
+### Recording Events
+
+Events are recorded with microsecond-precision elapsed times:
+
+<CodeGroup>
+```rust trace.rs:109
+pub fn record_event(&mut self, kind: EventKind, content: &str) {
+    let elapsed_ms = self.start.elapsed().as_millis() as u64;
+
+    if is_trace_verbose() {
+        match &kind {
+            EventKind::Text => {
+                // Buffer text and flush complete lines — avoids per-token noise.
+                self.text_buf.push_str(content);
+                while let Some(nl) = self.text_buf.find('\n') {
+                    let line = self.text_buf[..nl].to_string();
+                    self.text_buf.drain(..=nl);
+                    if !line.is_empty() {
+                        eprintln!("[{}] TEXT: {}", self.step_name, truncate(&line, 120));
+                    }
+                }
+            }
+            _ => {
+                // Flush any buffered text before printing a non-Text event.
+                self.flush_text_buf();
+                let label = match &kind {
+                    EventKind::ToolRequest => "TOOL_REQ",
+                    EventKind::ToolResponse => "TOOL_RES",
+                    EventKind::Thinking => "THINK",
+                    EventKind::Error => "ERROR",
+                    _ => unreachable!(),
+                };
+                eprintln!("[{}] {}: {}", self.step_name, label, truncate(content, 120));
+            }
+        }
+    }
+
+    if matches!(kind, EventKind::ToolRequest) {
+        self.tool_call_count += 1;
+    }
+
+    self.events.push(TraceEvent {
+        kind,
+        content: content.to_string(),
+        elapsed_ms,
+    });
+}
+```
+</CodeGroup>
+
+### Writing to Disk
+
+Traces are appended to date-stamped JSONL files:
+
+<CodeGroup>
+```rust trace.rs:196
+pub fn write_trace(trace: &AgentCallTrace, trace_dir: &Path) -> Result<()> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(trace_dir)?;
+
+    let date_str = date_from_unix_ms(trace.started_at);
+    let file_path = trace_dir.join(format!("magpie-trace-{date_str}.jsonl"));
+
+    let line = serde_json::to_string(trace)?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)?;
+    writeln!(file, "{line}")?;
+
+    debug!(path = %file_path.display(), "trace written");
+    Ok()
+}
+```
+</CodeGroup>
+
+<Tip>
+Trace files are named by the date the trace was **started**, not when it was written. Multi-hour pipeline runs that span midnight will write all traces to the same file.
+</Tip>
+
+## Verbose Mode
+
+### Global Flag
+
+Verbose trace output is controlled by a global atomic flag:
+
+<CodeGroup>
+```rust trace.rs:13
+static TRACE_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_trace_verbose(enabled: bool) {
+    TRACE_VERBOSE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn is_trace_verbose() -> bool {
+    TRACE_VERBOSE.load(Ordering::Relaxed)
+}
+```
+</CodeGroup>
+
+### Output Format
+
+Verbose mode prints to stderr in the following format:
+
+```
+[step-name] LABEL: content (truncated to 120 chars)
+```
+
+**Labels:**
+- `CALL` — Agent call started (prompt preview)
+- `TEXT` — Agent output (buffered by line)
+- `TOOL_REQ` — Tool request
+- `TOOL_RES` — Tool response
+- `THINK` — Thinking block
+- `ERROR` — Error
+- `DONE` — Call finished (duration + tool count)
+
+<Note>
+Text events are **line-buffered** to reduce noise from streaming tokens. Only complete lines are printed. Any remaining buffered text is flushed when a non-Text event arrives or when the trace finishes.
+</Note>
+
+## Integration with Pipeline
+
+### Tier 1: Claude CLI Calls
+
+All Tier 1 calls (`claude -p`) are traced:
+
+<CodeGroup>
+```rust pipeline.rs:1322
+async fn claude_call(prompt: &str, step_name: &str, trace_dir: Option<&PathBuf>) -> Result<String> {
+    let mut tb = TraceBuilder::new(step_name, prompt);
+
+    let output = tokio::process::Command::new("claude")
+        .args(["-p", prompt])
+        .env_remove("CLAUDECODE")
+        .output()
+        .await
+        .context("failed to run `claude` CLI — is it installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tb.record_event(EventKind::Error, &stderr);
+        let trace = tb.finish("");
+        if let Some(dir) = trace_dir {
+            let _ = trace::write_trace(&trace, dir);
+        }
+        anyhow::bail!("claude CLI exited with {}: {}", output.status, stderr.trim());
+    }
+
+    let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    tb.record_event(EventKind::Text, &response);
+
+    let trace = tb.finish(&response);
+    if let Some(dir) = trace_dir {
+        let _ = trace::write_trace(&trace, dir);
+    }
+
+    Ok(response)
+}
+```
+</CodeGroup>
+
+Step names for Tier 1 calls:
+- `branch-slug`
+- `classify`
+- `commit-message`
+
+### Tier 2: Goose Agent Calls
+
+Goose agent calls (via `MagpieAgent`) emit streaming events that are automatically recorded. See `agent.rs` for implementation details.
+
+## Analysis Examples
+
+### Count Tool Calls Per Step
+
+```bash
+cat .magpie/traces/magpie-trace-2024-01-15.jsonl \
+  | jq -r '[.step_name, .tool_call_count] | @tsv'
+```
+
+Output:
+```
+branch-slug     0
+classify        0
+plan            0
+write-tests     4
+implement       8
+```
+
+### Filter by Duration
+
+Find agent calls that took longer than 30 seconds:
+
+```bash
+cat .magpie/traces/magpie-trace-*.jsonl \
+  | jq 'select(.duration_ms > 30000) | {step: .step_name, duration_sec: (.duration_ms/1000)}'
+```
+
+### Extract Tool Requests
+
+List all tool requests from a specific step:
+
+```bash
+cat .magpie/traces/magpie-trace-*.jsonl \
+  | jq -r 'select(.step_name == "implement") | .events[] | select(.kind == "tool_request") | .content'
+```
+
+### Trace Replay
+
+Replay verbose output from a trace file:
+
+```bash
+cat .magpie/traces/magpie-trace-2024-01-15.jsonl \
+  | jq -r '.events[] | "[\(.elapsed_ms)ms] \(.kind): \(.content)"' \
+  | head -50
+```
+
+## Storage and Rotation
+
+### File Naming
+
+Trace files are named by UTC date:
+
+```
+.magpie/traces/
+├── magpie-trace-2024-01-15.jsonl
+├── magpie-trace-2024-01-16.jsonl
+└── magpie-trace-2024-01-17.jsonl
+```
+
+Each date gets its own file. All traces from that day (across multiple pipeline runs) are appended to the same file.
+
+### Disk Usage
+
+Typical trace sizes:
+- **Simple task** (docs-only): ~2-5 KB per trace
+- **Standard task** (TDD flow): ~20-50 KB per trace (multiple agent steps)
+- **Complex task** (bug fix, diagnostic): ~50-100 KB per trace
+
+A 1000-run month generates approximately **50-100 MB** of trace data.
+
+### Rotation Strategy
+
+<Tip>
+Magpie does **not** automatically rotate or prune trace files. Implement your own rotation policy:
+
+```bash
+# Delete traces older than 30 days
+find .magpie/traces -name "magpie-trace-*.jsonl" -mtime +30 -delete
+```
+</Tip>
+
+## Testing
+
+```bash
+cargo test -p magpie-core -- trace
+```
+
+Key test cases:
+- ✅ `test_trace_builder_records_events`
+- ✅ `test_write_trace_creates_jsonl`
+- ✅ `test_date_from_unix_ms`
+- ✅ `test_verbose_flag_default_off`
+- ✅ `test_truncate_long_string`
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Blueprint Engine" icon="diagram-project" href="/api/blueprint-engine">
+    Understand which steps generate traces
+  </Card>
+  <Card title="Agent Architecture" icon="robot" href="/concepts/two-tier-agent">
+    Tier 1 vs Tier 2 tracing behavior
+  </Card>
+</CardGroup>

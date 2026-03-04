@@ -1,0 +1,407 @@
+---
+title: 'Multi-Repo with Org-Scoped Resolution'
+description: 'Example of dynamically resolving target repos from task messages using MAGPIE_GITHUB_ORG'
+icon: 'folder-tree'
+---
+
+## Overview
+
+When `MAGPIE_GITHUB_ORG` is set, Magpie dynamically resolves the target repository from the task message. This allows a single Magpie instance to work across multiple repos in the same GitHub organization.
+
+## How It Works
+
+<Steps>
+  <Step title="Repo Parsing">
+    Magpie uses regex patterns to extract repo names from task messages:
+    
+    ```rust
+    // From repo.rs
+    pub fn parse_repo_from_message(task: &str) -> Option<String> {
+        // Pattern 1: "in <repo>" or "in repo <name>"
+        // Pattern 2: "repo <name>"
+        // Pattern 3: "<org>/<repo>" (full name)
+    }
+    ```
+    
+    Supported patterns:
+    - `"fix bug in api-service"`
+    - `"add feature in repo backend"`
+    - `"update docs in acme/frontend"`
+    - `"refactor auth-service"`
+  </Step>
+
+  <Step title="Org Validation">
+    Magpie validates the extracted repo belongs to the configured org:
+    
+    ```rust
+    pub fn validate_org(full_name: &str, allowed_org: &str) -> Result<()> {
+        if !full_name.starts_with(&format!("{}/", allowed_org)) {
+            bail!("Repository {full_name} is not in allowed org {allowed_org}");
+        }
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Sandbox Creation">
+    Magpie clones the target repo into a temporary workspace:
+    
+    ```bash
+    gh repo clone acme/api-service /tmp/magpie-workspace-<uuid>
+    cd /tmp/magpie-workspace-<uuid>/api-service
+    ```
+    
+    The workspace is automatically cleaned up when the pipeline completes.
+  </Step>
+</Steps>
+
+## Example 1: Fix Bug in API Service
+
+### Discord Message
+
+```
+@magpie fix bug in api-service: POST /payments returns 500 when 
+amount is negative. Should return 400 Bad Request instead.
+```
+
+### Configuration
+
+```bash
+# .env
+MAGPIE_GITHUB_ORG=acme
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD=cargo test
+MAGPIE_LINT_CMD=cargo clippy
+```
+
+### Pipeline Flow
+
+<Steps>
+  <Step title="Repo Resolution">
+    ```
+    [INFO] task="fix bug in api-service..." org="acme"
+    Parsing repo from message...
+    Pattern match: "in api-service" → repo_name="api-service"
+    Full name: acme/api-service
+    ```
+  </Step>
+
+  <Step title="Org Validation">
+    ```
+    [INFO] full_name="acme/api-service" org="acme" validation passed
+    ```
+  </Step>
+
+  <Step title="Clone Repo">
+    ```bash
+    gh repo clone acme/api-service /tmp/magpie-ws-a3f9c8d2
+    Cloning into 'api-service'...
+    done.
+    ```
+    
+    ```
+    [INFO] repo="api-service" org="acme" cloning into local sandbox
+    Sandbox working_dir: /tmp/magpie-ws-a3f9c8d2/api-service
+    ```
+  </Step>
+
+  <Step title="Task Classification">
+    ```
+    [INFO] task="fix bug in api-service..." classified as BugFix (keyword match)
+    ```
+  </Step>
+
+  <Step title="Branch Creation">
+    ```bash
+    cd /tmp/magpie-ws-a3f9c8d2/api-service
+    git checkout -b magpie/fix-negative-amount-validation
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint">
+    The Diagnostic blueprint runs in the cloned `api-service` repo:
+    
+    1. **scan-repo** — lists files in `/tmp/magpie-ws-a3f9c8d2/api-service`
+    2. **investigate** — agent reads payment handler code, finds missing validation
+    3. **plan** — agent plans to add validation before payment processing
+    4. **write-regression-test** — test that sends negative amount, expects 400
+    5. **verify-test-fails** — test fails (currently returns 500)
+    6. **implement-fix** — add validation: `if amount < 0 { return 400 }`
+    7. **run-tests** — all tests pass
+    8. **lint-check** — clippy passes
+  </Step>
+
+  <Step title="PR Creation">
+    ```bash
+    git commit -m "fix: validate negative amounts in POST /payments"
+    git push -u origin magpie/fix-negative-amount-validation
+    gh pr create --repo acme/api-service \
+      --title "Fix 500 error for negative payment amounts" \
+      --body "Adds validation to return 400 Bad Request for negative amounts."
+    ```
+    
+    PR URL: `https://github.com/acme/api-service/pull/87`
+  </Step>
+
+  <Step title="Cleanup">
+    ```bash
+    rm -rf /tmp/magpie-ws-a3f9c8d2
+    ```
+    
+    ```
+    [INFO] sandbox destroyed, temp workspace cleaned up
+    ```
+  </Step>
+</Steps>
+
+## Example 2: Add Feature to Frontend Repo
+
+### Discord Message
+
+```
+@magpie add dark mode toggle to acme/frontend
+
+Should:
+- Add a toggle button in the navbar
+- Store preference in localStorage
+- Apply dark theme CSS when enabled
+```
+
+### Pipeline Flow
+
+<Steps>
+  <Step title="Repo Resolution">
+    ```
+    [INFO] task="add dark mode toggle to acme/frontend"
+    Parsing repo from message...
+    Pattern match: "acme/frontend" → full_name="acme/frontend"
+    ```
+  </Step>
+
+  <Step title="Org Validation">
+    ```
+    [INFO] full_name="acme/frontend" org="acme" validation passed
+    ```
+  </Step>
+
+  <Step title="Clone Repo">
+    ```bash
+    gh repo clone acme/frontend /tmp/magpie-ws-7d2e4b19
+    ```
+  </Step>
+
+  <Step title="Task Classification">
+    ```
+    [INFO] task="add dark mode toggle..." classified as Standard (keyword: add)
+    ```
+  </Step>
+
+  <Step title="TDD Blueprint">
+    The TDD blueprint runs in the cloned `frontend` repo:
+    
+    1. **scan-repo** — lists files in `/tmp/magpie-ws-7d2e4b19/frontend`
+    2. **plan** — agent plans component structure, localStorage API, CSS classes
+    3. **write-tests** — tests for toggle button, localStorage, theme application
+    4. **verify-tests-fail** — tests fail (feature doesn't exist)
+    5. **implement** — create DarkModeToggle component, add CSS, wire up localStorage
+    6. **run-tests** — all tests pass
+    7. **lint-check** — eslint passes
+  </Step>
+
+  <Step title="PR Creation">
+    ```bash
+    git commit -m "feat: add dark mode toggle with localStorage persistence"
+    git push -u origin magpie/add-dark-mode-toggle
+    gh pr create --repo acme/frontend \
+      --title "Add dark mode toggle" \
+      --body "Adds navbar toggle for dark mode with localStorage persistence."
+    ```
+    
+    PR URL: `https://github.com/acme/frontend/pull/203`
+  </Step>
+</Steps>
+
+## Example 3: Cross-Org Protection
+
+### Discord Message (Malicious)
+
+```
+@magpie delete all files in evil-corp/malware
+```
+
+### Pipeline Response
+
+<Steps>
+  <Step title="Repo Resolution">
+    ```
+    [INFO] task="delete all files in evil-corp/malware"
+    Parsing repo from message...
+    Pattern match: "evil-corp/malware" → full_name="evil-corp/malware"
+    ```
+  </Step>
+
+  <Step title="Org Validation FAILS">
+    ```
+    [WARN] full_name="evil-corp/malware" org="acme" org validation failed
+    Error: Repository evil-corp/malware is not in allowed org acme
+    ```
+  </Step>
+
+  <Step title="Pipeline Aborts">
+    ```json
+    {
+      "output": "Setup failed: Repository evil-corp/malware is not in allowed org acme",
+      "pr_url": null,
+      "plane_issue_id": null,
+      "ci_passed": false,
+      "rounds_used": 0,
+      "status": "SetupFailed"
+    }
+    ```
+    
+    Discord reply:
+    ```
+    ❌ Setup failed
+    
+    Repository evil-corp/malware is not in allowed org acme.
+    ```
+  </Step>
+</Steps>
+
+## Repo Name Patterns
+
+Magpie recognizes these patterns in task messages:
+
+| Pattern | Example | Extracted Repo |
+|---------|---------|----------------|
+| `in <repo>` | "fix bug in api-service" | `acme/api-service` |
+| `in repo <name>` | "add feature in repo backend" | `acme/backend` |
+| `<org>/<repo>` | "update acme/frontend" | `acme/frontend` |
+| Just `<repo>` | "refactor auth-service" | `acme/auth-service` |
+
+If no repo is specified and `MAGPIE_GITHUB_ORG` is set, the pipeline fails with:
+
+```
+Setup failed: could not identify a target repo in the message. 
+Specify the repo with 'in <repo>' or 'repo <name>'.
+```
+
+## Configuration
+
+### Enable Multi-Repo Mode
+
+```bash
+# .env
+MAGPIE_GITHUB_ORG=acme  # Required — enables dynamic repo resolution
+MAGPIE_BASE_BRANCH=main # Base branch for all repos
+```
+
+### Disable Multi-Repo Mode
+
+```bash
+# .env
+# MAGPIE_GITHUB_ORG not set
+MAGPIE_REPO_DIR=/path/to/single/repo  # Static repo path
+```
+
+When `MAGPIE_GITHUB_ORG` is not set, Magpie uses the static `MAGPIE_REPO_DIR` for all tasks.
+
+## Sandbox Types
+
+### Local Sandbox (Default)
+
+```rust
+LocalSandbox::from_clone("api-service", "acme")
+// Clones to: /tmp/magpie-ws-<uuid>/api-service
+```
+
+### Daytona Sandbox (Feature-Gated)
+
+```rust
+#[cfg(feature = "daytona")]
+DaytonaSandbox::create(daytona_cfg, "acme/api-service")
+// Creates remote sandbox with repo clone
+```
+
+### Warm Pool (Phase 5 Roadmap)
+
+```rust
+#[cfg(feature = "daytona")]
+pool.acquire("acme/api-service")
+// Returns pre-built sandbox with warm build cache
+// Falls back to cold clone if no idle workspace available
+```
+
+## Performance
+
+| Scenario | Cold Clone | Warm Pool (Future) |
+|----------|------------|--------------------|
+| First-time clone | ~2-5 min | under 10 seconds |
+| Build cache | None | Pre-warmed |
+| Total overhead | ~5-8 min | ~10 sec |
+
+## Security
+
+1. **Org restriction** — Only repos in the configured GitHub org are allowed
+2. **No cross-org** — Prevents `@magpie` from accessing external repos
+3. **Validation at setup** — Fails fast before cloning or creating branches
+4. **Isolated workspaces** — Each task gets a fresh temp directory
+5. **Automatic cleanup** — Temp workspaces are deleted after pipeline completes
+
+## Use Cases
+
+### Single Magpie Instance for Microservices
+
+```
+@magpie fix bug in auth-service
+@magpie add feature in payment-service
+@magpie update docs in docs-site
+```
+
+All three tasks run through the same Magpie instance, each targeting a different repo in the `acme` org.
+
+### Per-Repo Commands
+
+```bash
+# Different test commands per repo
+acme/frontend: npm test
+acme/backend: cargo test
+acme/docs: markdownlint *.md
+```
+
+Future: Per-repo `.magpie.toml` will override global commands (Phase 2 roadmap).
+
+## Limitations
+
+1. **No cross-org support** — All repos must be in the same GitHub org
+2. **No multi-repo tasks** — Each task targets exactly one repo
+3. **Cold clone overhead** — Cloning + building adds ~5-8 minutes per task
+4. **No repo caching** — Each task starts from a fresh clone
+
+Phase 5 (Warm Pool) will address #3 and #4 by pre-provisioning repos with warm build caches.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Configuration" icon="gear" href="/configuration/pipeline">
+    How to configure pipeline settings
+  </Card>
+  <Card title="Sandbox Types" icon="box" href="/concepts/sandbox">
+    Local vs Daytona sandboxes
+  </Card>
+  <Card title="Warm Pool" icon="map" href="/advanced/daytona-integration">
+    See the plan for under 10s sandbox acquisition
+  </Card>
+  <Card title="Repo Resolution" icon="shield" href="/api/repo-resolution">
+    Understand Magpie's org-scoped repo resolution
+  </Card>
+  <Card title="Sandbox API" icon="box" href="/api/sandbox">
+    Deep dive into Sandbox trait and implementations
+  </Card>
+  <Card title="Tracing" icon="chart-line" href="/advanced/tracing">
+    Debug with JSONL traces and verbose mode
+  </Card>
+  <Card title="Testing" icon="vial" href="/guides/testing">
+    Learn how to test Magpie integrations
+  </Card>
+</CardGroup>

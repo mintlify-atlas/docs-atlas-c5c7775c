@@ -1,0 +1,219 @@
+---
+title: Introduction
+description: Autonomous AI coding pipeline that takes tasks from chat, writes code with AI agents, runs CI, and opens pull requests
+mode: custom
+---
+
+<div className="relative overflow-hidden bg-gradient-to-br from-[#1D3557] via-[#2a4a6f] to-[#1D3557] dark:from-[#0f1117] dark:via-[#1a1d27] dark:to-[#0f1117] py-20">
+  <div className="max-w-6xl mx-auto px-6 lg:px-8">
+    <div className="grid lg:grid-cols-12 gap-8 lg:gap-12 items-center">
+      <div className="lg:col-span-7">
+        <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold text-white mb-6">
+          Autonomous AI coding pipeline
+        </h1>
+        <p className="text-lg sm:text-xl text-gray-300 dark:text-gray-400 max-w-2xl mb-8">
+          Chat triggers the work. Magpie does the rest. From task description to pull request, fully automated with AI agents, CI validation, and intelligent blueprint execution.
+        </p>
+        <div className="flex flex-wrap gap-4">
+          <a 
+            href="/quickstart" 
+            className="inline-flex items-center px-6 py-3 rounded-lg bg-[#E63946] hover:bg-[#d62839] text-white font-semibold transition-colors no-underline"
+          >
+            Get Started
+          </a>
+          <a 
+            href="/concepts/architecture" 
+            className="inline-flex items-center px-6 py-3 rounded-lg border border-white/30 bg-white/10 hover:bg-white/20 text-white font-semibold transition-colors no-underline"
+          >
+            View Architecture
+          </a>
+        </div>
+      </div>
+      <div className="lg:col-span-5 hidden lg:block">
+        <div className="relative">
+          <div className="absolute inset-0 bg-gradient-to-r from-[#E63946]/20 to-[#F1FAEE]/20 blur-3xl"></div>
+          <div className="relative bg-[#1a1d27]/50 dark:bg-[#242838]/50 backdrop-blur-sm rounded-2xl border border-white/10 p-6">
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <div className="w-3 h-3 rounded-full bg-[#E63946]"></div>
+                <span className="text-sm text-gray-300">@magpie fix login bug</span>
+              </div>
+              <div className="pl-6 space-y-2 text-sm text-gray-400">
+                <div className="flex items-center gap-2">
+                  <span className="text-green-400">✓</span>
+                  <span>Task classified: BugFix</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-green-400">✓</span>
+                  <span>Running diagnostic blueprint</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-green-400">✓</span>
+                  <span>Tests passing • Lint clean</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-green-400">✓</span>
+                  <span>PR opened: #247</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-2xl sm:text-3xl font-semibold text-gray-900 dark:text-white mb-3">
+    How it works
+  </h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">
+    Magpie orchestrates a complete autonomous coding pipeline from a single chat message
+  </p>
+  
+  <Steps>
+    <Step title="Trigger from chat">
+      Mention `@magpie` in Discord, Teams, or run a CLI command with your task description. Magpie reads the full thread context to understand requirements.
+    </Step>
+    
+    <Step title="Intelligent classification">
+      The pipeline analyzes your task and classifies it as Simple (docs/typos), Standard (features), or BugFix (fixes). Each complexity level triggers a different blueprint optimized for that work.
+      
+      ```bash
+      Simple   → single-shot agent call
+      Standard → TDD: plan → tests → implement
+      BugFix   → Diagnostic: investigate → regression test → fix
+      ```
+    </Step>
+    
+    <Step title="Agent execution with blueprints">
+      Magpie uses a two-tier LLM architecture: Claude CLI for text generation (branch names, commit messages) and Goose agent for coding work. The blueprint engine orchestrates deterministic Shell steps and AI Agent steps in sequence.
+      
+      <Accordion title="Example TDD blueprint flow">
+      ```
+      scan-repo → plan → write-tests → verify-tests-fail 
+      → implement → run-tests → lint-check
+      ```
+      </Accordion>
+    </Step>
+    
+    <Step title="CI loop with auto-fix">
+      After the agent completes coding, Magpie runs your configured lint and test commands. If CI fails, the fix blueprint receives the error output and attempts repairs (up to 2 rounds by default).
+      
+      ```rust
+      // Configured via environment variables
+      MAGPIE_LINT_CMD="cargo clippy"
+      MAGPIE_TEST_CMD="cargo test"
+      MAGPIE_MAX_CI_ROUNDS="2"
+      ```
+    </Step>
+    
+    <Step title="Commit, push, and PR">
+      Once tests pass, Magpie generates a commit message, pushes to a new branch with collision handling, and opens a pull request via `gh` CLI. The result is posted back to your chat thread.
+      
+      <Note>
+      Magpie integrates with Plane for issue tracking and Daytona for sandboxed execution. All agent calls are traced to JSONL for observability.
+      </Note>
+    </Step>
+  </Steps>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-2xl sm:text-3xl font-semibold text-gray-900 dark:text-white mb-3">
+    Key features
+  </h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">
+    Built for production autonomous coding workflows
+  </p>
+  
+  <CardGroup cols={2}>
+    <Card title="Blueprint engine" icon="sitemap" href="/concepts/blueprints">
+      Hybrid orchestration with deterministic Shell steps and AI Agent steps. Three built-in blueprints: Simple, TDD, and Diagnostic.
+    </Card>
+    
+    <Card title="Two-tier LLM" icon="layer-group" href="/concepts/two-tier-agent">
+      Tier 1 (Claude CLI) for clean text generation. Tier 2 (Goose agent) for multi-turn coding with full tool access.
+    </Card>
+    
+    <Card title="Multi-platform adapters" icon="comments" href="/adapters/discord">
+      Discord bot, Teams webhook, and CLI. All implement the ChatPlatform trait for consistent integration.
+    </Card>
+    
+    <Card title="Sandbox abstraction" icon="box" href="/concepts/sandbox">
+      Local execution or remote Daytona sandboxes. Swap implementations via trait without pipeline changes.
+    </Card>
+    
+    <Card title="Org-scoped repos" icon="code-branch" href="/advanced/org-scoped-repos">
+      Dynamic repo resolution from task messages. One Magpie instance works across multiple repositories in your GitHub org.
+    </Card>
+    
+    <Card title="CI classification" icon="check-circle" href="/advanced/ci-classification">
+      Docs-only changes skip CI. Built-in test steps in blueprints eliminate redundant CI runs.
+    </Card>
+    
+    <Card title="Observability" icon="chart-line" href="/advanced/tracing">
+      JSONL traces for every agent call. Verbose mode prints streaming events. Debug and audit all LLM interactions.
+    </Card>
+    
+    <Card title="Git automation" icon="git-alt" href="/api/git-ops">
+      Branch collision handling, conventional commit generation, and PR automation via GitHub CLI.
+    </Card>
+  </CardGroup>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-2xl sm:text-3xl font-semibold text-gray-900 dark:text-white mb-3">
+    Architecture at a glance
+  </h2>
+  <p className="text-base text-gray-600 dark:text-gray-400 mb-8">
+    Magpie is a Rust workspace with four crates
+  </p>
+  
+  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div className="bg-gray-50 dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-lg p-6">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">magpie-core</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        Core library. Pipeline orchestrator, blueprint engine, agent wrapper, git ops, Plane client, repo resolution, tracing. All other crates depend on this.
+      </p>
+    </div>
+    
+    <div className="bg-gray-50 dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-lg p-6">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">magpie-cli</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        CLI binary for running prompts, blueprints, or the full pipeline locally. Thin wrapper around magpie-core.
+      </p>
+    </div>
+    
+    <div className="bg-gray-50 dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-lg p-6">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">magpie-discord</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        Discord bot adapter (Serenity). Triggers pipeline when @magpie is mentioned. Creates a thread per task, archives on completion.
+      </p>
+    </div>
+    
+    <div className="bg-gray-50 dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-lg p-6">
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">magpie-teams</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400">
+        Microsoft Teams webhook adapter (Axum). Receives Bot Framework events and triggers the pipeline.
+      </p>
+    </div>
+  </div>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="bg-gradient-to-br from-[#E63946]/10 to-[#1D3557]/10 dark:from-[#E63946]/5 dark:to-[#1D3557]/10 border border-[#E63946]/20 dark:border-[#E63946]/10 rounded-2xl p-8 md:p-12">
+    <h2 className="text-2xl sm:text-3xl font-semibold text-gray-900 dark:text-white mb-4">
+      Ready to automate your coding workflow?
+    </h2>
+    <p className="text-base text-gray-600 dark:text-gray-400 mb-6 max-w-2xl">
+      Get started with Magpie in minutes. Install the CLI, configure your environment, and start issuing tasks from Discord, Teams, or the command line.
+    </p>
+    <a 
+      href="/quickstart" 
+      className="inline-flex items-center px-6 py-3 rounded-lg bg-[#E63946] hover:bg-[#d62839] text-white font-semibold transition-colors no-underline"
+    >
+      Get Started Now
+    </a>
+  </div>
+</div>

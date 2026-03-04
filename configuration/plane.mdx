@@ -1,0 +1,322 @@
+---
+title: 'Plane Configuration'
+description: 'Configure Plane issue tracking integration for automatic issue creation and updates'
+---
+
+## Overview
+
+Magpie integrates with self-hosted [Plane](https://plane.so) to automatically create and update issues for each task. When configured, the pipeline:
+
+1. Creates a Plane issue at the start of each run
+2. Updates the issue status on completion (`done` or `in_progress`)
+3. Adds a comment with the PR URL when available
+
+## Configuration Structure
+
+```rust
+pub struct PlaneConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub workspace_slug: String,
+    pub project_id: String,
+}
+```
+
+Source: `crates/magpie-core/src/plane.rs:5-11`
+
+## Environment Variables
+
+<ParamField path="PLANE_BASE_URL" type="string" required>
+  Self-hosted Plane instance URL (without trailing slash).
+
+  **Example**:
+  ```bash
+  PLANE_BASE_URL=https://plane.company.com
+  ```
+</ParamField>
+
+<ParamField path="PLANE_API_KEY" type="string" required>
+  Plane API key for authentication.
+
+  **How to Get**:
+  1. Log in to your Plane instance
+  2. Navigate to **Settings → API Tokens**
+  3. Create a new token
+  4. Copy and set as env var
+
+  **Example**:
+  ```bash
+  PLANE_API_KEY=plane_abc123xyz456...
+  ```
+</ParamField>
+
+<ParamField path="PLANE_WORKSPACE_SLUG" type="string" required>
+  Workspace slug (visible in Plane URLs).
+
+  **Example**:
+  ```bash
+  PLANE_WORKSPACE_SLUG=engineering
+  ```
+
+  **How to Find**: Look at your Plane URL: `https://plane.company.com/<workspace-slug>/projects/...`
+</ParamField>
+
+<ParamField path="PLANE_PROJECT_ID" type="string" required>
+  Project ID for auto-created issues.
+
+  **Example**:
+  ```bash
+  PLANE_PROJECT_ID=proj-xyz789
+  ```
+
+  **How to Find**: Navigate to a project in Plane and look at the URL or use the Plane API to list projects.
+</ParamField>
+
+## PlaneClient API
+
+The `PlaneClient` provides three main operations:
+
+### Create Issue
+
+```rust
+pub async fn create_issue(&self, title: &str, description_html: &str) -> Result<String>
+```
+
+Creates a new work item and returns the issue ID.
+
+**Example**:
+```rust
+let client = PlaneClient::new(config)?;
+let issue_id = client
+    .create_issue(
+        "Add OAuth2 PKCE flow",
+        "<p>Task from @user via Discord: implement PKCE for OAuth2</p>"
+    )
+    .await?;
+```
+
+Source: `crates/magpie-core/src/plane.rs:42-65`
+
+### Update Issue
+
+```rust
+pub async fn update_issue(&self, issue_id: &str, update: &IssueUpdate) -> Result<()>
+```
+
+Updates an existing issue with partial fields (state, description, priority).
+
+**Example**:
+```rust
+client.update_issue(
+    &issue_id,
+    &IssueUpdate {
+        state: Some("done".to_string()),
+        ..Default::default()
+    }
+).await?;
+```
+
+Source: `crates/magpie-core/src/plane.rs:68-80`
+
+### Add Comment
+
+```rust
+pub async fn add_comment(&self, issue_id: &str, body_html: &str) -> Result<()>
+```
+
+Adds a comment to an issue (used to attach PR URLs).
+
+**Example**:
+```rust
+let pr_url = "https://github.com/org/repo/pull/123";
+let comment = format!("<p>PR created: <a href=\"{pr_url}\">{pr_url}</a></p>");
+client.add_comment(&issue_id, &comment).await?;
+```
+
+Source: `crates/magpie-core/src/plane.rs:83-104`
+
+## IssueUpdate Fields
+
+```rust
+pub struct IssueUpdate {
+    pub state: Option<String>,
+    pub description_html: Option<String>,
+    pub priority: Option<String>,
+}
+```
+
+All fields are optional. Only provided fields are sent in the PATCH request.
+
+<ParamField path="state" type="Option<String>">
+  Issue state (`done`, `in_progress`, `todo`, etc.).
+
+  **Example**:
+  ```rust
+  state: Some("done".to_string())
+  ```
+</ParamField>
+
+<ParamField path="description_html" type="Option<String>">
+  HTML-formatted issue description.
+
+  **Example**:
+  ```rust
+  description_html: Some("<p>Updated description</p>".to_string())
+  ```
+</ParamField>
+
+<ParamField path="priority" type="Option<String>">
+  Issue priority (`high`, `medium`, `low`, etc.).
+
+  **Example**:
+  ```rust
+  priority: Some("high".to_string())
+  ```
+</ParamField>
+
+Source: `crates/magpie-core/src/plane.rs:117-126`
+
+## Pipeline Integration
+
+When Plane is configured, the pipeline automatically:
+
+**1. Create issue at start**
+
+```rust
+let desc = format!("<p>Task from {user} via {}: {task}</p>", platform.name());
+let issue_id = client.create_issue(task, &desc).await?;
+```
+
+Source: `crates/magpie-core/src/pipeline.rs:914-936`
+
+**2. Update issue on completion**
+
+```rust
+let state = if ci_passed { "done" } else { "in_progress" };
+client.update_issue(
+    &issue_id,
+    &IssueUpdate {
+        state: Some(state.to_string()),
+        ..Default::default()
+    }
+).await?;
+```
+
+Source: `crates/magpie-core/src/pipeline.rs:1194-1204`
+
+**3. Add PR comment**
+
+```rust
+if let Some(url) = &pr_url {
+    let comment = format!("<p>PR created: <a href=\"{url}\">{url}</a></p>");
+    client.add_comment(&issue_id, &comment).await?;
+}
+```
+
+Source: `crates/magpie-core/src/pipeline.rs:1206-1210`
+
+## Example Configurations
+
+### Minimal Setup
+
+```bash
+PLANE_BASE_URL=https://plane.example.com
+PLANE_API_KEY=plane_abc123...
+PLANE_WORKSPACE_SLUG=engineering
+PLANE_PROJECT_ID=proj-xyz789
+```
+
+### Production Setup
+
+```bash
+# Plane (issue tracking)
+PLANE_BASE_URL=https://plane.company.com
+PLANE_API_KEY=plane_abc123xyz456...
+PLANE_WORKSPACE_SLUG=engineering
+PLANE_PROJECT_ID=proj-magpie-tasks
+
+# Pipeline
+MAGPIE_GITHUB_ORG=my-company
+MAGPIE_BASE_BRANCH=main
+
+# Discord
+DISCORD_TOKEN=MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.AbCdEf.GhIjKlMnOpQrStUvWxYz
+```
+
+## Error Handling
+
+All Plane operations are **non-blocking**. If Plane API calls fail, the pipeline continues and logs a warning:
+
+```rust
+match client.create_issue(task, &desc).await {
+    Ok(id) => {
+        info!(issue_id = %id, "created Plane issue");
+        Some(id)
+    }
+    Err(e) => {
+        warn!("failed to create Plane issue: {e}");
+        None
+    }
+}
+```
+
+This ensures that Plane outages don't block the entire pipeline.
+
+Source: `crates/magpie-core/src/pipeline.rs:918-932`
+
+## API Endpoints
+
+The `PlaneClient` uses these Plane API endpoints:
+
+### Work Items
+
+```
+POST   {base_url}/api/v1/workspaces/{workspace}/projects/{project}/work-items/
+PATCH  {base_url}/api/v1/workspaces/{workspace}/projects/{project}/work-items/{id}/
+```
+
+### Comments
+
+```
+POST   {base_url}/api/v1/workspaces/{workspace}/projects/{project}/issues/{id}/comments/
+```
+
+All requests include these headers:
+
+```
+X-API-Key: {api_key}
+Content-Type: application/json
+```
+
+Source: `crates/magpie-core/src/plane.rs:106-113`
+
+## Troubleshooting
+
+### 401 Unauthorized
+
+**Cause**: Invalid API key.
+
+**Fix**: Verify your `PLANE_API_KEY` is correct and has not expired.
+
+### 404 Not Found
+
+**Cause**: Invalid workspace slug or project ID.
+
+**Fix**: Check the URL structure in your Plane instance and verify `PLANE_WORKSPACE_SLUG` and `PLANE_PROJECT_ID`.
+
+### Network Timeout
+
+**Cause**: Plane instance is unreachable or slow.
+
+**Fix**: Check your `PLANE_BASE_URL` and ensure the Plane instance is accessible from your Magpie deployment.
+
+### Issues Not Appearing
+
+**Cause**: Pipeline logs a warning but doesn't fail.
+
+**Fix**: Check the Magpie logs for `failed to create Plane issue` warnings. Verify all four Plane env vars are set correctly.
+
+## Related Documentation
+
+- [Pipeline Configuration](/configuration/pipeline) — Core pipeline settings
+- [Environment Variables](/configuration/environment) — Complete env var reference

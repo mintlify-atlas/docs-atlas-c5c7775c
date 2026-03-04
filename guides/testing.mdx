@@ -1,0 +1,601 @@
+---
+title: Testing Guide
+description: Learn how to write and run tests in Magpie
+---
+
+## Overview
+
+Magpie uses Rust's built-in testing framework with additional tools for mocking external services. Tests are co-located with the code they test in `#[cfg(test)]` modules.
+
+## Running Tests
+
+### Basic Test Commands
+
+```bash
+# Run all tests
+cargo test
+
+# Run tests for a specific crate
+cargo test -p magpie-core
+
+# Run a specific test by name
+cargo test -p magpie-core test_slugify
+
+# Run tests with output shown
+cargo test -- --nocapture
+
+# Run ignored tests (requires external services)
+cargo test -- --ignored
+
+# Run all tests including ignored
+cargo test -- --include-ignored
+```
+
+### Building with Features
+
+```bash
+# Build with Daytona sandbox support
+cargo build -p magpie-core --features daytona
+
+# Test with features
+cargo test -p magpie-core --features daytona
+```
+
+## Test Structure
+
+Tests are written inline using `#[cfg(test)]` modules:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_slugify_simple() {
+        assert_eq!(slugify("Fix the login bug"), "fix-the-login-bug");
+    }
+    
+    #[tokio::test]
+    async fn test_async_function() {
+        let result = some_async_fn().await;
+        assert!(result.is_ok());
+    }
+}
+```
+
+### Test Organization
+
+- **Unit tests**: In-file `#[cfg(test)]` modules at the bottom of each source file
+- **Integration tests**: Would go in `tests/` directory (not currently used)
+- **Test helpers**: Shared test utilities in `#[cfg(test)]` modules
+
+## Ignored Tests
+
+Tests that require external services (Claude CLI, GitHub CLI, Daytona API) are marked with `#[ignore]`:
+
+```rust
+#[tokio::test]
+#[ignore] // requires DAYTONA_API_KEY and network access
+async fn test_daytona_sandbox_connectivity() {
+    let cfg = test_config();
+    // ... test code
+}
+```
+
+**Common reasons for `#[ignore]`**:
+- Requires `claude` CLI authenticated
+- Requires `gh` CLI authenticated
+- Requires `DAYTONA_API_KEY` environment variable
+- Requires network access
+- Long-running or expensive operations
+
+### Running Ignored Tests
+
+```bash
+# Run only ignored tests
+cargo test -- --ignored
+
+# Run all tests including ignored
+cargo test -- --include-ignored
+```
+
+<Warning>
+Ignored tests may:
+- Make API calls to external services
+- Create/destroy remote resources
+- Require valid authentication credentials
+- Take several minutes to complete
+</Warning>
+
+## MockSandbox for Testing
+
+The `MockSandbox` allows you to test code that depends on command execution without actually running commands:
+
+```rust
+use crate::sandbox::{MockSandbox, ExecOutput};
+
+#[tokio::test]
+async fn test_with_mock_sandbox() {
+    // Create a mock sandbox with pre-configured responses
+    let sandbox = MockSandbox::new("/tmp")
+        .with_response(
+            "git",
+            ExecOutput {
+                stdout: "On branch main".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        );
+    
+    // Execute command (returns mocked response)
+    let output = sandbox.exec("git", &["status"]).await.unwrap();
+    assert_eq!(output.stdout, "On branch main");
+    assert_eq!(output.exit_code, 0);
+    
+    // Verify what was executed
+    let recorded = sandbox.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].command, "git");
+    assert_eq!(recorded[0].args, vec!["status"]);
+}
+```
+
+### MockSandbox Methods
+
+```rust
+// Create a new mock sandbox
+let sandbox = MockSandbox::new("/working/dir");
+
+// Configure response for specific command
+let sandbox = sandbox.with_response("command", ExecOutput { ... });
+
+// Set default response for unmatched commands
+let sandbox = sandbox.with_default_response(ExecOutput { ... });
+
+// Get all recorded command executions
+let recorded = sandbox.recorded();
+
+// Check if destroy() was called
+let destroyed = sandbox.is_destroyed();
+```
+
+### MockSandbox File Operations
+
+```rust
+#[tokio::test]
+async fn test_mock_file_operations() {
+    let sandbox = MockSandbox::new("/tmp");
+    
+    // Write a file
+    sandbox.write_file("test.txt", b"hello").await.unwrap();
+    
+    // Read it back
+    let content = sandbox.read_file("test.txt").await.unwrap();
+    assert_eq!(content, b"hello");
+    
+    // Reading non-existent file returns error
+    let result = sandbox.read_file("missing.txt").await;
+    assert!(result.is_err());
+}
+```
+
+## Testing with wiremock
+
+For testing HTTP integrations (Plane API, Teams webhooks), use `wiremock` to mock HTTP servers:
+
+```rust
+use wiremock::{
+    matchers::{method, path},
+    Mock, MockServer, ResponseTemplate,
+};
+
+#[tokio::test]
+async fn test_plane_create_issue() {
+    // Start a mock HTTP server
+    let mock_server = MockServer::start().await;
+    
+    // Configure mock response
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workspaces/my-workspace/projects/proj-abc/work-items/"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({"id": "issue-123"}))
+        )
+        .mount(&mock_server)
+        .await;
+    
+    // Create client pointing to mock server
+    let config = PlaneConfig {
+        base_url: mock_server.uri(),
+        api_key: "test-key".to_string(),
+        workspace_slug: "my-workspace".to_string(),
+        project_id: "proj-abc".to_string(),
+    };
+    let client = PlaneClient::new(config).unwrap();
+    
+    // Make request (hits mock server)
+    let id = client
+        .create_issue("Test issue", "<p>Description</p>")
+        .await
+        .unwrap();
+    
+    assert_eq!(id, "issue-123");
+}
+```
+
+### Common wiremock Patterns
+
+```rust
+// Match specific method and path
+Mock::given(method("POST"))
+    .and(path("/api/endpoint"))
+    .respond_with(ResponseTemplate::new(200))
+    .mount(&mock_server)
+    .await;
+
+// Return JSON response
+Mock::given(method("GET"))
+    .and(path("/api/data"))
+    .respond_with(
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"key": "value"}))
+    )
+    .mount(&mock_server)
+    .await;
+
+// Simulate server error
+Mock::given(method("POST"))
+    .and(path("/api/fail"))
+    .respond_with(ResponseTemplate::new(500))
+    .mount(&mock_server)
+    .await;
+```
+
+## Test Helpers and Utilities
+
+### Creating Test Configurations
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn test_config() -> PlaneConfig {
+        PlaneConfig {
+            base_url: "https://plane.example.com".to_string(),
+            api_key: "test-key-123".to_string(),
+            workspace_slug: "my-workspace".to_string(),
+            project_id: "proj-abc".to_string(),
+        }
+    }
+    
+    #[test]
+    fn test_something() {
+        let config = test_config();
+        // use config...
+    }
+}
+```
+
+### Temporary Directories
+
+```rust
+use tempfile;
+
+#[test]
+fn test_with_temp_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    
+    // Use path for testing...
+    std::fs::write(path.join("test.txt"), "content").unwrap();
+    
+    // Directory is automatically cleaned up when 'dir' is dropped
+}
+```
+
+### Git Test Repositories
+
+```rust
+fn init_test_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    
+    // Init repo with main as default branch
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(path)
+        .output()
+        .unwrap();
+    
+    // Configure git
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(path)
+        .output()
+        .unwrap();
+    
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(path)
+        .output()
+        .unwrap();
+    
+    dir
+}
+```
+
+## Assertions
+
+### Basic Assertions
+
+```rust
+// Equality
+assert_eq!(actual, expected);
+assert_ne!(actual, not_expected);
+
+// Boolean
+assert!(condition);
+assert!(!condition);
+
+// Result/Option
+assert!(result.is_ok());
+assert!(result.is_err());
+assert!(option.is_some());
+assert!(option.is_none());
+```
+
+### Assertions with Context
+
+```rust
+// Add helpful failure messages
+assert_eq!(
+    slugify("test"),
+    "test",
+    "slugify should handle simple input"
+);
+
+assert!(
+    slug.len() <= 50,
+    "slug too long: expected <= 50, got {}",
+    slug.len()
+);
+```
+
+### Testing Errors
+
+```rust
+#[test]
+fn test_error_case() {
+    let result = some_function();
+    assert!(result.is_err(), "should return error for invalid input");
+    
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("expected error text"));
+}
+```
+
+## Testing Best Practices
+
+### 1. Test Names Should Be Descriptive
+
+```rust
+// ✓ Good
+#[test]
+fn test_slugify_removes_special_characters() { ... }
+
+#[test]
+fn test_create_issue_returns_error_on_server_failure() { ... }
+
+// ✗ Bad
+#[test]
+fn test1() { ... }
+
+#[test]
+fn it_works() { ... }
+```
+
+### 2. Test One Thing at a Time
+
+```rust
+// ✓ Good - focused test
+#[test]
+fn test_slugify_lowercases_input() {
+    assert_eq!(slugify("HELLO"), "hello");
+}
+
+#[test]
+fn test_slugify_replaces_spaces_with_hyphens() {
+    assert_eq!(slugify("hello world"), "hello-world");
+}
+
+// ✗ Bad - testing multiple behaviors
+#[test]
+fn test_slugify() {
+    assert_eq!(slugify("HELLO"), "hello");
+    assert_eq!(slugify("hello world"), "hello-world");
+    assert_eq!(slugify("test!"), "test");
+}
+```
+
+### 3. Use Test Helpers for Setup
+
+```rust
+// ✓ Good - reusable helper
+fn create_test_sandbox() -> MockSandbox {
+    MockSandbox::new("/tmp")
+        .with_response(
+            "git",
+            ExecOutput {
+                stdout: "On branch main".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        )
+}
+
+#[tokio::test]
+async fn test_with_sandbox() {
+    let sandbox = create_test_sandbox();
+    // test code...
+}
+```
+
+### 4. Test Error Cases
+
+```rust
+#[tokio::test]
+async fn test_create_issue_handles_server_error() {
+    let mock_server = MockServer::start().await;
+    
+    Mock::given(method("POST"))
+        .and(path("/api/work-items/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+    
+    let client = PlaneClient::new(mock_config(&mock_server.uri())).unwrap();
+    let result = client.create_issue("Test", "<p>Desc</p>").await;
+    
+    assert!(result.is_err(), "should return error on 500 status");
+}
+```
+
+### 5. Avoid Flaky Tests
+
+```rust
+// ✗ Bad - timing dependent
+#[tokio::test]
+async fn test_flaky() {
+    tokio::spawn(async { do_work().await });
+    tokio::time::sleep(Duration::from_millis(100)).await; // ← Race condition
+    assert!(check_result());
+}
+
+// ✓ Good - explicit synchronization
+#[tokio::test]
+async fn test_stable() {
+    let handle = tokio::spawn(async { do_work().await });
+    handle.await.unwrap(); // Wait for completion
+    assert!(check_result());
+}
+```
+
+## Test Coverage
+
+To check test coverage, you can use `cargo-tarpaulin`:
+
+```bash
+# Install
+cargo install cargo-tarpaulin
+
+# Run coverage
+cargo tarpaulin --out Html --output-dir coverage
+
+# Open coverage report
+open coverage/index.html
+```
+
+## Continuous Integration
+
+Tests run automatically in CI on every PR. The CI pipeline:
+
+1. Runs `cargo fmt --check` (formatting)
+2. Runs `cargo clippy -- -D warnings` (lints)
+3. Runs `cargo test` (tests, excluding `#[ignore]`)
+4. Runs `cargo build` (compilation check)
+
+All checks must pass before a PR can be merged.
+
+## Examples from the Codebase
+
+### Example: Testing the slugify Function
+
+From `crates/magpie-core/src/git.rs:257`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slugify_simple() {
+        assert_eq!(slugify("Fix the login bug"), "fix-the-login-bug");
+    }
+
+    #[test]
+    fn test_slugify_special_chars() {
+        assert_eq!(slugify("Add API v2 (beta)!"), "add-api-v2-beta");
+    }
+
+    #[test]
+    fn test_slugify_consecutive_spaces() {
+        assert_eq!(slugify("fix   multiple   spaces"), "fix-multiple-spaces");
+    }
+
+    #[test]
+    fn test_slugify_long_input() {
+        let long = "a".repeat(100);
+        let slug = slugify(&long);
+        assert!(slug.len() <= 50);
+    }
+}
+```
+
+### Example: Testing with MockSandbox
+
+From `crates/magpie-core/src/sandbox/mock.rs:122`:
+
+```rust
+#[tokio::test]
+async fn test_mock_sandbox_records_commands() {
+    let sandbox = MockSandbox::new("/tmp");
+    sandbox.exec("echo", &["hello"]).await.unwrap();
+    sandbox.exec("git", &["status"]).await.unwrap();
+
+    let recorded = sandbox.recorded();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].command, "echo");
+    assert_eq!(recorded[0].args, vec!["hello"]);
+    assert_eq!(recorded[1].command, "git");
+    assert_eq!(recorded[1].args, vec!["status"]);
+}
+```
+
+### Example: Testing with wiremock
+
+From `crates/magpie-core/src/plane.rs:192`:
+
+```rust
+#[tokio::test]
+async fn test_create_issue_success() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workspaces/my-workspace/projects/proj-abc/work-items/"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({"id": "issue-123"}))
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = PlaneClient::new(mock_config(&mock_server.uri())).unwrap();
+    let id = client
+        .create_issue("Test issue", "<p>Description</p>")
+        .await
+        .unwrap();
+    
+    assert_eq!(id, "issue-123");
+}
+```
+
+## Summary
+
+- Use `cargo test` for basic test runs
+- Mark tests requiring external services with `#[ignore]`
+- Use `MockSandbox` for testing command execution
+- Use `wiremock` for testing HTTP integrations
+- Write focused tests with descriptive names
+- Test both success and error cases
+- Add helpful assertion messages

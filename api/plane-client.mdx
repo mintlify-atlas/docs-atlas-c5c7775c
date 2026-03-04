@@ -1,0 +1,284 @@
+---
+title: PlaneClient
+description: HTTP client for Plane issue tracking integration.
+---
+
+## Overview
+
+`PlaneClient` is an HTTP client for interacting with self-hosted Plane instances. It provides methods for creating issues, updating issue state, and adding comments. Used by Magpie to track pipeline runs as Plane work items.
+
+## Configuration
+
+### PlaneConfig
+
+```rust
+#[derive(Debug, Clone)]
+pub struct PlaneConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub workspace_slug: String,
+    pub project_id: String,
+}
+```
+
+<ParamField path="base_url" type="String" required>
+  Base URL of the Plane instance (e.g., `https://plane.example.com`).
+</ParamField>
+
+<ParamField path="api_key" type="String" required>
+  API key for authentication. Sent as `X-API-Key` header.
+</ParamField>
+
+<ParamField path="workspace_slug" type="String" required>
+  Workspace identifier (e.g., `my-workspace`).
+</ParamField>
+
+<ParamField path="project_id" type="String" required>
+  Project identifier (e.g., `proj-abc`).
+</ParamField>
+
+### IssueUpdate
+
+```rust
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IssueUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+```
+
+Partial update fields for an issue. All fields are optional and only non-`None` values are sent to the API.
+
+## Client Creation
+
+<ParamField path="new" type="fn(config: PlaneConfig) -> Result<Self>" required>
+  Create a new PlaneClient instance.
+  
+  **Parameters:**
+  - `config` - Plane configuration with base URL, API key, workspace, and project
+  
+  **Returns:**
+  - `Ok(PlaneClient)` - Configured client ready for use
+  - `Err(_)` - If API key is invalid or client creation fails
+  
+  **Example:**
+  ```rust
+  use magpie_core::plane::{PlaneClient, PlaneConfig};
+  
+  let config = PlaneConfig {
+      base_url: "https://plane.example.com".to_string(),
+      api_key: "test-key-123".to_string(),
+      workspace_slug: "my-workspace".to_string(),
+      project_id: "proj-abc".to_string(),
+  };
+  
+  let client = PlaneClient::new(config)?;
+  ```
+</ParamField>
+
+## Methods
+
+<ParamField path="create_issue" type="async fn(&self, title: &str, description_html: &str) -> Result<String>" required>
+  Create a new work item. Returns the issue ID.
+  
+  **Parameters:**
+  - `title` - Issue title (plain text)
+  - `description_html` - Issue description in HTML format
+  
+  **Returns:**
+  - `Ok(String)` - The created issue ID
+  - `Err(_)` - If creation fails (network error, authentication, etc.)
+  
+  **API Endpoint:** `POST {base_url}/api/v1/workspaces/{workspace}/projects/{project}/work-items/`
+  
+  **Example:**
+  ```rust
+  let issue_id = client
+      .create_issue(
+          "Fix login bug in api-service",
+          "<p>Pipeline run for task: fix login bug</p>"
+      )
+      .await?;
+  println!("Created issue: {}", issue_id);
+  ```
+</ParamField>
+
+<ParamField path="update_issue" type="async fn(&self, issue_id: &str, update: &IssueUpdate) -> Result<()>" required>
+  Update an existing issue with partial fields.
+  
+  **Parameters:**
+  - `issue_id` - The issue ID to update
+  - `update` - Partial update fields (only non-None fields are sent)
+  
+  **Returns:**
+  - `Ok(())` - Update successful
+  - `Err(_)` - If update fails
+  
+  **API Endpoint:** `PATCH {base_url}/api/v1/workspaces/{workspace}/projects/{project}/work-items/{issue_id}/`
+  
+  **Example:**
+  ```rust
+  use magpie_core::plane::IssueUpdate;
+  
+  // Update only the state
+  let update = IssueUpdate {
+      state: Some("done".to_string()),
+      ..Default::default()
+  };
+  client.update_issue("issue-123", &update).await?;
+  
+  // Update multiple fields
+  let update = IssueUpdate {
+      state: Some("in_progress".to_string()),
+      description_html: Some("<p>Updated description</p>".to_string()),
+      priority: Some("high".to_string()),
+  };
+  client.update_issue("issue-123", &update).await?;
+  ```
+</ParamField>
+
+<ParamField path="add_comment" type="async fn(&self, issue_id: &str, body_html: &str) -> Result<()>" required>
+  Add a comment to an issue.
+  
+  **Parameters:**
+  - `issue_id` - The issue ID to comment on
+  - `body_html` - Comment body in HTML format
+  
+  **Returns:**
+  - `Ok(())` - Comment added successfully
+  - `Err(_)` - If adding comment fails
+  
+  **API Endpoint:** `POST {base_url}/api/v1/workspaces/{workspace}/projects/{project}/issues/{issue_id}/comments/`
+  
+  **Example:**
+  ```rust
+  client
+      .add_comment(
+          "issue-123",
+          "<p>CI passed, PR ready for review</p>"
+      )
+      .await?;
+  ```
+</ParamField>
+
+## Complete Example
+
+```rust
+use magpie_core::plane::{PlaneClient, PlaneConfig, IssueUpdate};
+use anyhow::Result;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Configure client
+    let config = PlaneConfig {
+        base_url: "https://plane.example.com".to_string(),
+        api_key: std::env::var("PLANE_API_KEY")?,
+        workspace_slug: "engineering".to_string(),
+        project_id: "backend-proj".to_string(),
+    };
+    
+    let client = PlaneClient::new(config)?;
+    
+    // Create issue for pipeline run
+    let issue_id = client
+        .create_issue(
+            "Pipeline: Fix authentication bug",
+            "<p>Automated pipeline run started</p>
+             <p>Task: fix auth bug in api-service</p>"
+        )
+        .await?;
+    
+    println!("Created issue: {}", issue_id);
+    
+    // Update state to in progress
+    client
+        .update_issue(
+            &issue_id,
+            &IssueUpdate {
+                state: Some("in_progress".to_string()),
+                ..Default::default()
+            }
+        )
+        .await?;
+    
+    // Add progress comment
+    client
+        .add_comment(
+            &issue_id,
+            "<p>Agent finished coding, running CI...</p>"
+        )
+        .await?;
+    
+    // Mark as done
+    client
+        .update_issue(
+            &issue_id,
+            &IssueUpdate {
+                state: Some("done".to_string()),
+                description_html: Some(
+                    "<p>Pipeline completed successfully</p>
+                     <p>PR: https://github.com/org/repo/pull/123</p>"
+                        .to_string()
+                ),
+                ..Default::default()
+            }
+        )
+        .await?;
+    
+    Ok(())
+}
+```
+
+## Usage in Pipeline
+
+The `PlaneClient` is integrated into the pipeline to track progress:
+
+```rust
+use magpie_core::{PipelineConfig, run_pipeline};
+use magpie_core::plane::{PlaneClient, PlaneConfig};
+
+let plane_config = PlaneConfig {
+    base_url: std::env::var("PLANE_BASE_URL")?,
+    api_key: std::env::var("PLANE_API_KEY")?,
+    workspace_slug: std::env::var("PLANE_WORKSPACE")?,
+    project_id: std::env::var("PLANE_PROJECT_ID")?,
+};
+
+let plane_client = PlaneClient::new(plane_config)?;
+
+let config = PipelineConfig {
+    repo_dir: "/path/to/repo".into(),
+    task: "fix login bug".to_string(),
+    plane_client: Some(plane_client),
+    // ... other config
+};
+
+let result = run_pipeline(config).await?;
+```
+
+## Error Handling
+
+All methods return `anyhow::Result` for flexible error handling. The client:
+
+- Returns errors for non-2xx HTTP status codes with response body details
+- Validates API key format during client creation
+- Includes context in errors (e.g., "Plane create_issue failed (500): error details")
+
+```rust
+match client.create_issue("Title", "<p>Description</p>").await {
+    Ok(issue_id) => println!("Created: {}", issue_id),
+    Err(e) => eprintln!("Failed to create issue: {}", e),
+}
+```
+
+## Design Notes
+
+- All HTTP requests include `X-API-Key` and `Content-Type: application/json` headers
+- Built on `reqwest` with default headers configured at client creation
+- Serialization uses `serde_json` with `skip_serializing_if` for optional fields
+- Issue IDs are returned as strings (Plane uses UUID format)
+- HTML descriptions allow rich formatting in the Plane UI

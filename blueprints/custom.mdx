@@ -1,0 +1,584 @@
+---
+title: 'Building Custom Blueprints'
+description: 'Create your own deterministic AI workflows with Blueprint::new() and .add_step()'
+icon: 'wrench'
+---
+
+## Overview
+
+While Magpie ships with three production blueprints (Simple, TDD, Diagnostic), the real power is **building your own workflows**. The blueprint API is simple:
+
+1. Create a blueprint with `Blueprint::new(name)`
+2. Add steps with `.add_step(step)`
+3. Run it with `BlueprintRunner::new(ctx, sandbox).run(&bp)`
+
+<Note>
+Custom blueprints let you encode **domain-specific workflows** — database migrations, deployment scripts, security audits, performance profiling, etc.
+</Note>
+
+## Basic Example: Echo Blueprint
+
+The simplest possible blueprint with two shell steps:
+
+```rust
+use magpie_core::blueprint::{
+    Blueprint, BlueprintRunner, Step, StepKind, Condition,
+};
+use magpie_core::blueprint::steps::ShellStep;
+use magpie_core::sandbox::LocalSandbox;
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 1. Create blueprint
+    let bp = Blueprint::new("echo-demo")
+        .add_step(Step {
+            name: "greet".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("echo").with_args(vec!["Hello, world!".to_string()])
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        })
+        .add_step(Step {
+            name: "show-date".to_string(),
+            kind: StepKind::Shell(ShellStep::new("date")),
+            condition: Condition::Always,
+            continue_on_error: false,
+        });
+
+    // 2. Create context and sandbox
+    let ctx = StepContext::new(PathBuf::from("."));
+    let sandbox = LocalSandbox::from_path(PathBuf::from("."));
+
+    // 3. Run blueprint
+    let final_ctx = BlueprintRunner::new(ctx, &sandbox).run(&bp).await?;
+
+    println!("Last output: {:?}", final_ctx.last_output);
+    Ok(())
+}
+```
+
+**Output:**
+```
+[1/2] greet (shell) → running...
+[1/2] greet → OK (exit 0)
+[2/2] show-date (shell) → running...
+[2/2] show-date → OK (exit 0)
+Last output: Some("Tue Mar  4 09:05:23 UTC 2026\n")
+```
+
+## Conditional Steps
+
+Run steps only when certain conditions are met.
+
+### Example: Retry on Failure
+
+```rust
+let bp = Blueprint::new("retry-demo")
+    .add_step(Step {
+        name: "attempt-1".to_string(),
+        kind: StepKind::Shell(ShellStep::new("false")), // always fails
+        condition: Condition::Always,
+        continue_on_error: true, // don't stop blueprint
+    })
+    .add_step(Step {
+        name: "retry".to_string(),
+        kind: StepKind::Shell(
+            ShellStep::new("echo").with_args(vec!["Retrying...".to_string()])
+        ),
+        condition: Condition::IfExitCodeNot(0), // only if previous failed
+        continue_on_error: false,
+    })
+    .add_step(Step {
+        name: "attempt-2".to_string(),
+        kind: StepKind::Shell(ShellStep::new("true")), // succeeds
+        condition: Condition::IfExitCodeNot(0), // only if retry ran
+        continue_on_error: false,
+    });
+```
+
+**Execution:**
+```
+[1/3] attempt-1 (shell) → exit 1 (continuing)
+[2/3] retry (shell) → OK (exit 0)
+[3/3] attempt-2 (shell) → OK (exit 0)
+```
+
+### Example: Skip if Success
+
+```rust
+let bp = Blueprint::new("skip-demo")
+    .add_step(Step {
+        name: "check-cache".to_string(),
+        kind: StepKind::Shell(
+            ShellStep::new("test").with_args(vec!["-f".to_string(), "cache.db".to_string()])
+        ),
+        condition: Condition::Always,
+        continue_on_error: true,
+    })
+    .add_step(Step {
+        name: "build-cache".to_string(),
+        kind: StepKind::Shell(
+            ShellStep::new("echo").with_args(vec!["Building cache...".to_string()])
+        ),
+        condition: Condition::IfExitCodeNot(0), // only if cache missing
+        continue_on_error: false,
+    });
+```
+
+**If `cache.db` exists:** Step 2 is skipped.
+**If `cache.db` missing:** Step 2 runs.
+
+## Agent Steps
+
+Use `AgentStep` to incorporate AI-powered work.
+
+### Example: Analyze + Fix
+
+```rust
+use magpie_core::blueprint::steps::AgentStep;
+
+let bp = Blueprint::new("analyze-fix")
+    .add_step(Step {
+        name: "run-tests".to_string(),
+        kind: StepKind::Shell(
+            ShellStep::new("cargo").with_args(vec!["test".to_string()])
+        ),
+        condition: Condition::Always,
+        continue_on_error: true,
+    })
+    .add_step(Step {
+        name: "analyze-failures".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(
+                "Analyze the test failures and identify the root cause. \
+                 Do NOT fix yet — just explain what's broken."
+            )
+            .with_last_output() // inject test output
+        ),
+        condition: Condition::IfExitCodeNot(0), // only if tests failed
+        continue_on_error: false,
+    })
+    .add_step(Step {
+        name: "fix-issues".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(
+                "Based on the analysis, fix the failing tests."
+            )
+            .with_last_output() // inject analysis from previous step
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+```
+
+**Flow:**
+1. Run tests → capture failures
+2. Agent reads test output, explains root cause
+3. Agent reads explanation, implements fix
+
+## Using Metadata for Cross-Cutting Context
+
+The `StepContext.metadata` HashMap lets you pass context between steps.
+
+### Example: Inject Chat History
+
+```rust
+let mut ctx = StepContext::new(PathBuf::from("."));
+ctx.metadata.insert(
+    "chat_history".to_string(),
+    "User asked: How do I run tests?\nBot replied: Use `cargo test`".to_string(),
+);
+
+let bp = Blueprint::new("context-demo")
+    .add_step(Step {
+        name: "answer-question".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new("Answer the user's question based on the conversation.")
+                .with_context_from_metadata("chat_history") // prepend history
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+let final_ctx = BlueprintRunner::new(ctx, &sandbox).run(&bp).await?;
+```
+
+The agent prompt becomes:
+```
+Context from conversation:
+```
+User asked: How do I run tests?
+Bot replied: Use `cargo test`
+```
+
+Answer the user's question based on the conversation.
+```
+
+## Real-World Example: Database Migration Blueprint
+
+A production-ready blueprint for running database migrations:
+
+```rust
+pub fn build_migration_blueprint(
+    migration_name: &str,
+    db_url: &str,
+) -> Result<(Blueprint, StepContext)> {
+    let mut ctx = StepContext::new(PathBuf::from("."));
+    ctx.metadata.insert("db_url".to_string(), db_url.to_string());
+    ctx.metadata.insert("migration".to_string(), migration_name.to_string());
+
+    let bp = Blueprint::new("db-migration")
+        // Step 1: Backup database
+        .add_step(Step {
+            name: "backup-db".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("pg_dump")
+                    .with_args(vec![
+                        "-d".to_string(),
+                        db_url.to_string(),
+                        "-f".to_string(),
+                        format!("backup-{}.sql", chrono::Utc::now().timestamp()),
+                    ])
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        })
+        // Step 2: Run migration
+        .add_step(Step {
+            name: "apply-migration".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("diesel")
+                    .with_args(vec!["migration".to_string(), "run".to_string()])
+            ),
+            condition: Condition::Always,
+            continue_on_error: true, // don't stop if migration fails
+        })
+        // Step 3: Verify schema
+        .add_step(Step {
+            name: "verify-schema".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("diesel")
+                    .with_args(vec!["migration".to_string(), "list".to_string()])
+            ),
+            condition: Condition::IfExitCode(0), // only if migration succeeded
+            continue_on_error: false,
+        })
+        // Step 4: Rollback on failure
+        .add_step(Step {
+            name: "rollback".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("diesel")
+                    .with_args(vec!["migration".to_string(), "revert".to_string()])
+            ),
+            condition: Condition::IfExitCodeNot(0), // only if migration failed
+            continue_on_error: false,
+        })
+        // Step 5: Send notification
+        .add_step(Step {
+            name: "notify".to_string(),
+            kind: StepKind::Agent(
+                AgentStep::new(
+                    "Send a Slack notification about the migration status. \
+                     Include the migration name and whether it succeeded or failed."
+                )
+                .with_last_output()
+            ),
+            condition: Condition::Always,
+            continue_on_error: true, // don't fail if notification fails
+        });
+
+    Ok((bp, ctx))
+}
+```
+
+**Features:**
+- Automatic backup before migration
+- Rollback on failure (conditional step)
+- Schema verification (conditional step)
+- Slack notification (agent step)
+- Graceful handling of notification failures (`continue_on_error: true`)
+
+## Testing Custom Blueprints with MockSandbox
+
+Use `MockSandbox` to test blueprints without running real commands:
+
+```rust
+use magpie_core::sandbox::{MockSandbox, ExecOutput};
+
+#[tokio::test]
+async fn test_migration_blueprint_success() {
+    let sandbox = MockSandbox::new("/workspace")
+        .with_response(
+            "pg_dump",
+            ExecOutput {
+                stdout: "Backup created\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        )
+        .with_response(
+            "diesel",
+            ExecOutput {
+                stdout: "Migration applied\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        );
+
+    let (bp, ctx) = build_migration_blueprint("add_users_table", "postgres://localhost/test")?;
+    let final_ctx = BlueprintRunner::new(ctx, &sandbox).run(&bp).await?;
+
+    // Verify rollback step was skipped (migration succeeded)
+    let recorded = sandbox.recorded();
+    assert_eq!(recorded.len(), 3); // backup + migration + verify (no rollback)
+    assert_eq!(recorded[0].command, "pg_dump");
+    assert_eq!(recorded[1].command, "diesel");
+    assert_eq!(recorded[2].command, "diesel");
+}
+```
+
+From `crates/magpie-core/src/blueprint/runner.rs:234-267`
+
+## Advanced Patterns
+
+### Pattern 1: Parallel Verification
+
+Run multiple checks in sequence but track all results:
+
+```rust
+let bp = Blueprint::new("multi-check")
+    .add_step(Step {
+        name: "check-lint".to_string(),
+        kind: StepKind::Shell(ShellStep::new("cargo").with_args(vec!["clippy".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: true, // don't stop on failure
+    })
+    .add_step(Step {
+        name: "check-format".to_string(),
+        kind: StepKind::Shell(ShellStep::new("cargo").with_args(vec!["fmt".to_string(), "--check".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: true, // don't stop on failure
+    })
+    .add_step(Step {
+        name: "check-tests".to_string(),
+        kind: StepKind::Shell(ShellStep::new("cargo").with_args(vec!["test".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: true, // don't stop on failure
+    })
+    .add_step(Step {
+        name: "summary".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(
+                "Summarize the CI check results. Which checks passed and which failed?"
+            )
+            .with_last_output()
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+```
+
+**Benefit:** All checks run even if some fail. Agent summarizes results.
+
+### Pattern 2: Dynamic Step Generation
+
+Generate steps programmatically:
+
+```rust
+fn build_multi_file_blueprint(files: &[&str]) -> Blueprint {
+    let mut bp = Blueprint::new("multi-file-process");
+
+    for file in files {
+        bp = bp.add_step(Step {
+            name: format!("process-{}", file),
+            kind: StepKind::Agent(
+                AgentStep::new(format!("Analyze {} and extract key insights.", file))
+            ),
+            condition: Condition::Always,
+            continue_on_error: true,
+        });
+    }
+
+    bp = bp.add_step(Step {
+        name: "consolidate".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new("Consolidate insights from all files into a single report.")
+                .with_last_output()
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    bp
+}
+
+let bp = build_multi_file_blueprint(&["report1.md", "report2.md", "report3.md"]);
+```
+
+### Pattern 3: Output Parsing
+
+Use shell commands to parse agent output:
+
+```rust
+let bp = Blueprint::new("extract-urls")
+    .add_step(Step {
+        name: "generate-report".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new("Generate a security report with links to CVEs.")
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    })
+    .add_step(Step {
+        name: "extract-cve-links".to_string(),
+        kind: StepKind::Shell(
+            ShellStep::new("grep")
+                .with_args(vec!["-oP".to_string(), r"https://cve.mitre.org/\S+".to_string()])
+        ),
+        condition: Condition::IfOutputContains("CVE-".to_string()),
+        continue_on_error: true,
+    })
+    .add_step(Step {
+        name: "download-cve-data".to_string(),
+        kind: StepKind::Shell(
+            ShellStep::new("xargs")
+                .with_args(vec!["-I".to_string(), "{}".to_string(), "curl".to_string(), "-O".to_string(), "{}".to_string()])
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Use descriptive step names">
+    Step names appear in logs as `[N/M] step-name → running...`. Make them actionable:
+    
+    **Good:** `verify-tests-fail`, `implement-oauth2`, `rollback-migration`
+    
+    **Bad:** `step1`, `run`, `agent`
+  </Accordion>
+
+  <Accordion title="Set continue_on_error strategically">
+    - **false (default):** Fail fast on errors. Use for critical steps.
+    - **true:** Log warning and continue. Use for:
+      - Expected failures (TDD red phase)
+      - Optional steps (notifications)
+      - Parallel checks (run all, summarize later)
+  </Accordion>
+
+  <Accordion title="Inject context with .with_last_output()">
+    Agent steps work best when they have context from previous steps:
+    
+    ```rust
+    AgentStep::new("Fix the test failures")
+        .with_last_output() // injects test output
+    ```
+    
+    This is how TDD/Diagnostic blueprints flow context through the pipeline.
+  </Accordion>
+
+  <Accordion title="Use metadata for cross-cutting concerns">
+    Instead of hardcoding values in prompts, use metadata:
+    
+    ```rust
+    ctx.metadata.insert("db_url".to_string(), db_url);
+    ctx.metadata.insert("trace_dir".to_string(), trace_dir);
+    ```
+    
+    This makes blueprints more reusable and testable.
+  </Accordion>
+
+  <Accordion title="Test with MockSandbox">
+    Always write tests for custom blueprints using `MockSandbox`:
+    
+    - Record expected command sequences
+    - Verify conditional steps run/skip correctly
+    - Test error handling paths
+    
+    See `crates/magpie-core/src/blueprint/runner.rs:234-267` for examples.
+  </Accordion>
+</AccordionGroup>
+
+## Common Pitfalls
+
+<Warning>
+**Forgetting .with_last_output()**
+
+If you want an agent step to read the previous step's output, you MUST call `.with_last_output()`:
+
+```rust
+// ❌ BAD: Agent can't see test failures
+AgentStep::new("Fix the failing tests")
+
+// ✅ GOOD: Agent receives test output in prompt
+AgentStep::new("Fix the failing tests").with_last_output()
+```
+</Warning>
+
+<Warning>
+**Hardcoding commands instead of using PipelineConfig**
+
+Magpie's built-in blueprints use `config.test_command` and `config.lint_command` for flexibility:
+
+```rust
+// ❌ BAD: Assumes Rust project
+ShellStep::new("cargo").with_args(vec!["test".to_string()])
+
+// ✅ GOOD: Respects user config
+let (cmd, args) = split_command(&config.test_command);
+ShellStep::new(cmd).with_args(args)
+```
+
+This lets the same blueprint work for Rust, Python, Node.js, etc.
+</Warning>
+
+## Integration with Magpie Pipeline
+
+To use a custom blueprint in the full Magpie pipeline:
+
+1. **Define a builder function** like `build_tdd_blueprint()`:
+   ```rust
+   pub fn build_my_blueprint(
+       trigger: &TriggerContext,
+       config: &PipelineConfig,
+       working_dir: &str,
+   ) -> Result<(Blueprint, StepContext)> {
+       let mut ctx = StepContext::new(PathBuf::from(working_dir));
+       trigger.hydrate(&mut ctx); // inject chat history
+       
+       let bp = Blueprint::new("my-workflow")
+           .add_step(/* ... */);
+       
+       Ok((bp, ctx))
+   }
+   ```
+
+2. **Call it from `run_pipeline()`**:
+   ```rust
+   let (bp, ctx) = build_my_blueprint(&trigger, config, &working_dir)?;
+   let final_ctx = BlueprintRunner::new(ctx, &*sandbox).run(&bp).await?;
+   ```
+
+3. **Handle CI loop** (optional):
+   ```rust
+   if final_ctx.last_exit_code != Some(0) {
+       // Run fix blueprint and retry
+   }
+   ```
+
+See `crates/magpie-core/src/pipeline.rs:730-1240` for the full integration.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Blueprint Engine Overview" icon="diagram-project" href="/blueprints/overview">
+    Deep dive into Blueprint, Step, Condition, and StepContext
+  </Card>
+  <Card title="Built-in Blueprints" icon="book" href="/blueprints/simple">
+    Study production blueprints for inspiration
+  </Card>
+</CardGroup>

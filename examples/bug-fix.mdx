@@ -1,0 +1,472 @@
+---
+title: 'Bug Fix with Diagnostic Blueprint'
+description: 'Example of a bug report flowing through the Diagnostic blueprint with root cause analysis'
+icon: 'bug'
+---
+
+## Overview
+
+Bug fixes flow through Magpie's **Diagnostic blueprint** (`magpie-diagnostic`). This approach forces the agent to investigate the root cause BEFORE planning a fix: scan → investigate → plan → write regression test → verify fail → fix → test → lint.
+
+## Task Classification
+
+Keywords that trigger the BugFix path:
+
+- `fix bug`, `fix crash`, `fix error`, `fix panic`
+- `broken`, `not working`, `regression`
+- `debug`, `investigate`, `root cause`, `diagnose`
+
+Note: `fix typo`, `fix docs` are classified as Simple (checked first).
+
+## Example: Fix Panic on Empty Task Message
+
+### Discord Message
+
+```
+@magpie fix crash: bot panics when someone mentions it with no message
+
+Stack trace:
+
+thread 'tokio-runtime-worker' panicked at 'called `Option::unwrap()` on a `None` value'
+crates/magpie-discord/src/handler.rs:47:52
+
+Steps to reproduce:
+1. Type "@magpie" in Discord with no text after it
+2. Bot crashes immediately
+```
+
+### Pipeline Flow
+
+<Steps>
+  <Step title="Task Classification">
+    Magpie detects the keyword `"fix crash"` and classifies this as **BugFix**.
+    
+    ```
+    [INFO] task="fix crash: bot panics when..." classified as BugFix (keyword match)
+    ```
+  </Step>
+
+  <Step title="Branch Creation">
+    Tier 1 Claude generates a descriptive branch slug:
+    
+    ```bash
+    claude -p "Generate a 3-6 word git branch slug for this task..."
+    # Output: fix-empty-message-panic
+    
+    git checkout -b magpie/fix-empty-message-panic
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 1: scan-repo">
+    The blueprint starts by scanning the repository structure:
+    
+    ```bash
+    find /workspace/magpie -type f \
+      -not -path '*/.git/*' \
+      -not -path '*/target/*' \
+      -not -path '*/node_modules/*'
+    ```
+    
+    Output includes the crash location:
+    ```
+    ...
+    /workspace/magpie/crates/magpie-discord/src/handler.rs
+    /workspace/magpie/crates/magpie-discord/src/main.rs
+    /workspace/magpie/crates/magpie-core/src/pipeline.rs
+    ...
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 2: investigate">
+    Agent traces the root cause WITHOUT modifying files:
+    
+    **Agent Prompt:**
+    ```
+    You are investigating a bug. The file tree of the repository is 
+    provided as previous step output.
+    
+    Bug report: fix crash: bot panics when someone mentions it with no message
+    
+    Stack trace:
+    thread 'tokio-runtime-worker' panicked at 'called `Option::unwrap()` 
+    on a `None` value'
+    crates/magpie-discord/src/handler.rs:47:52
+    
+    Your job is to find the ROOT CAUSE. Do NOT plan a fix yet. 
+    Do NOT modify any files.
+    
+    Instructions:
+    1. Trace the data flow through the affected code path
+    2. Read the relevant source files
+    3. Identify the exact location where behavior diverges from expectation
+    4. Name the specific files, functions, and line numbers involved
+    5. Explain WHY the bug occurs (not just WHAT happens)
+    
+    Output a clear investigation report with your findings.
+    ```
+    
+    **Agent Investigation:**
+    
+    Agent reads `crates/magpie-discord/src/handler.rs:47`:
+    ```rust
+    // handler.rs:42-50
+    pub async fn handle_mention(ctx: &Context, msg: &Message) -> Result<()> {
+        let bot_id = ctx.cache.current_user().id;
+        let content = msg.content.strip_prefix(&format!("<@{}>", bot_id));
+        
+        // Line 47 — THE PANIC
+        let task = content.unwrap().trim();
+        
+        if task.is_empty() {
+            return Ok(()); // early return for empty tasks
+        }
+        ...
+    ```
+    
+    Agent traces the code flow:
+    ```
+    ROOT CAUSE IDENTIFIED:
+    
+    File: crates/magpie-discord/src/handler.rs
+    Function: handle_mention()
+    Line: 47
+    
+    Problem:
+    The code calls .unwrap() on the result of strip_prefix(), which returns 
+    Option<&str>. When a user mentions the bot with NO text after the mention 
+    (e.g., just "@magpie"), strip_prefix() returns Some(""), but if the 
+    message format is unexpected or the prefix doesn't match exactly, it 
+    returns None.
+    
+    The .unwrap() panics when None is returned.
+    
+    Data flow:
+    1. Discord message: "@magpie" (no text after mention)
+    2. msg.content = "<@123456789>"
+    3. strip_prefix("<@123456789>") returns Some("")
+    4. BUT: If there's any whitespace or formatting difference, returns None
+    5. .unwrap() panics on None
+    
+    Why it happens:
+    Discord's mention format can vary (with/without nickname syntax: 
+    <@!123> vs <@123>). The code only handles one format.
+    
+    Affected code path:
+    - Discord event: MessageCreate
+    - handler.rs:handle_mention() line 47
+    - Panic occurs before any task validation
+    
+    Additional context:
+    Line 48 checks if task.is_empty(), but we never reach that check because 
+    the unwrap() panics first when strip_prefix returns None.
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 3: plan">
+    Agent creates a targeted fix plan based on investigation:
+    
+    **Agent Prompt:**
+    ```
+    Based on the investigation findings from the previous step, plan a 
+    targeted fix.
+    
+    Bug report: fix crash: bot panics when...
+    
+    Create a brief plan:
+    1. What is the root cause (from investigation)
+    2. What specific changes to make and why
+    3. What regression test to write
+    ```
+    
+    **Agent Plan:**
+    ```
+    Fix Plan:
+    
+    1. Root cause:
+       The code calls .unwrap() on strip_prefix() result at line 47, which 
+       panics when the mention format doesn't match (e.g., <@!123> vs <@123>).
+    
+    2. Specific changes:
+       a) Replace .unwrap() with proper Option handling using match or if-let
+       b) Handle BOTH mention formats: <@123> and <@!123> (nickname syntax)
+       c) Return early with Ok(()) when no valid task is extracted
+       d) Keep the existing empty-task check
+    
+    3. Regression test:
+       - test_handle_mention_with_no_text() — send "<@bot_id>" with no text
+       - test_handle_mention_nickname_syntax() — send "<@!bot_id>" format
+       - test_handle_mention_with_whitespace() — send "<@bot_id>   " 
+       Both should return Ok(()) without panicking.
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 4: write-regression-test">
+    Agent writes a test that REPRODUCES the bug:
+    
+    **Agent Prompt:**
+    ```
+    Based on the plan from the previous step, write a regression test 
+    that REPRODUCES the bug.
+    
+    Rules:
+    - The test should FAIL with the current (buggy) code
+    - It should PASS once the fix is applied
+    - Use the project's existing test patterns and framework
+    - Do NOT implement the fix yet — only the test
+    ```
+    
+    **Agent Output:**
+    ```rust
+    // crates/magpie-discord/src/handler.rs (added to #[cfg(test)] mod tests)
+    
+    #[tokio::test]
+    async fn test_handle_mention_no_text_no_panic() {
+        // Simulate a mention with no text after it
+        let ctx = mock_context();
+        let mut msg = mock_message();
+        msg.content = "<@123456789>".to_string(); // bot ID, no text
+        
+        // Should NOT panic
+        let result = handle_mention(&ctx, &msg).await;
+        assert!(result.is_ok());
+    }
+    
+    #[tokio::test]
+    async fn test_handle_mention_nickname_syntax() {
+        // Discord nickname mention format: <@!123> instead of <@123>
+        let ctx = mock_context();
+        let mut msg = mock_message();
+        msg.content = "<@!123456789> some task".to_string();
+        
+        // Should NOT panic and should extract "some task"
+        let result = handle_mention(&ctx, &msg).await;
+        assert!(result.is_ok());
+    }
+    
+    #[tokio::test]
+    async fn test_handle_mention_whitespace_only() {
+        let ctx = mock_context();
+        let mut msg = mock_message();
+        msg.content = "<@123456789>   ".to_string(); // only whitespace
+        
+        // Should return Ok without starting pipeline
+        let result = handle_mention(&ctx, &msg).await;
+        assert!(result.is_ok());
+    }
+    ```
+    
+    Agent confirms:
+    ```
+    Regression tests written. Created 3 test functions:
+    - test_handle_mention_no_text_no_panic
+    - test_handle_mention_nickname_syntax
+    - test_handle_mention_whitespace_only
+    
+    These will FAIL (panic) with the current code because of the unwrap() on line 47.
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 5: verify-test-fails">
+    Run tests to confirm they fail (reproduce the bug):
+    
+    ```bash
+    cargo test
+    ```
+    
+    Output:
+    ```
+    running 3 tests
+    test test_handle_mention_no_text_no_panic ... FAILED
+    test test_handle_mention_nickname_syntax ... FAILED
+    test test_handle_mention_whitespace_only ... FAILED
+    
+    failures:
+    
+    ---- test_handle_mention_no_text_no_panic stdout ----
+    thread 'test_handle_mention_no_text_no_panic' panicked at 
+    'called `Option::unwrap()` on a `None` value', 
+    crates/magpie-discord/src/handler.rs:47:52
+    
+    ---- test_handle_mention_nickname_syntax stdout ----
+    thread 'test_handle_mention_nickname_syntax' panicked at 
+    'called `Option::unwrap()` on a `None` value', 
+    crates/magpie-discord/src/handler.rs:47:52
+    
+    test result: FAILED. 0 passed; 3 failed
+    
+    [INFO] step="verify-test-fails" exit_code=101 (expected failure)
+    ```
+    
+    The blueprint continues because `continue_on_error: true` for this step.
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 6: implement-fix">
+    Agent fixes the root cause:
+    
+    **Agent Prompt:**
+    ```
+    The regression test from the previous step has been run. The output 
+    (including failures) is provided as previous step output.
+    
+    Bug report: fix crash: bot panics when...
+    
+    Now fix the ROOT CAUSE identified in the investigation step.
+    - Do NOT use workarounds or band-aids
+    - Fix the underlying issue, not just the symptoms
+    - Make sure the regression test passes
+    - Do not break existing tests
+    ```
+    
+    **Agent Output:**
+    ```rust
+    // crates/magpie-discord/src/handler.rs:42-55 (FIXED)
+    pub async fn handle_mention(ctx: &Context, msg: &Message) -> Result<()> {
+        let bot_id = ctx.cache.current_user().id;
+        let content = &msg.content;
+        
+        // Handle both mention formats: <@123> and <@!123> (nickname)
+        let task = if let Some(text) = content.strip_prefix(&format!("<@{}>", bot_id)) {
+            text.trim()
+        } else if let Some(text) = content.strip_prefix(&format!("<@!{}>", bot_id)) {
+            text.trim()
+        } else {
+            // Not a valid mention — return early
+            return Ok(());
+        };
+        
+        if task.is_empty() {
+            info!(user = %msg.author.name, "mention with no task — ignoring");
+            return Ok(()); // early return for empty tasks
+        }
+        
+        // Continue with pipeline...
+        let user = msg.author.name.clone();
+        let channel_id = msg.channel_id.to_string();
+        
+        info!(user = %user, task = %task, "received task");
+        // ... rest of handler
+    ```
+    
+    Agent confirms:
+    ```
+    Fix implemented:
+    - Removed .unwrap() on line 47
+    - Replaced with if-let chain handling both mention formats
+    - <@123> (standard) and <@!123> (nickname syntax)
+    - Returns Ok(()) early if no valid mention found
+    - Added logging for empty-task case
+    - All regression tests should now pass
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 7: run-tests">
+    Run tests again, expecting pass:
+    
+    ```bash
+    cargo test
+    ```
+    
+    Output:
+    ```
+    running 6 tests
+    test test_handle_mention_no_text_no_panic ... ok
+    test test_handle_mention_nickname_syntax ... ok
+    test test_handle_mention_whitespace_only ... ok
+    test test_handle_mention_with_task ... ok (existing test)
+    test test_create_thread ... ok (existing test)
+    test test_archive_thread ... ok (existing test)
+    
+    test result: ok. 6 passed; 0 failed; 0 ignored
+    
+    [INFO] step="run-tests" exit_code=0 tests passed
+    ```
+  </Step>
+
+  <Step title="Diagnostic Blueprint Step 8: lint-check">
+    ```bash
+    cargo clippy -- -D warnings
+    ```
+    
+    Output:
+    ```
+    Checking magpie-discord v0.1.0
+    Finished dev [unoptimized + debuginfo] target(s) in 2.87s
+    
+    [INFO] step="lint-check" exit_code=0 lint passed
+    ```
+  </Step>
+
+  <Step title="CI Classification">
+    Because the Diagnostic blueprint's built-in test+lint steps already passed:
+    
+    ```
+    [INFO] TDD tests+lint passed inside blueprint — skipping CI round 1
+    ```
+  </Step>
+
+  <Step title="Commit & PR">
+    Tier 1 Claude generates commit message:
+    
+    ```bash
+    claude -p "Generate a conventional commit message from this diff..."
+    # Output: fix: handle Discord nickname mentions without panicking
+    ```
+    
+    Git operations:
+    ```bash
+    git add crates/magpie-discord/src/handler.rs
+    git commit -m "fix: handle Discord nickname mentions without panicking"
+    git push -u origin magpie/fix-empty-message-panic
+    gh pr create --title "Fix panic on empty mention" \
+      --body "Fixes panic when bot is mentioned with no text or nickname syntax."
+    ```
+    
+    PR URL: `https://github.com/org/magpie/pull/144`
+  </Step>
+</Steps>
+
+## Pipeline Result
+
+```json
+{
+  "output": "Fix implemented: Removed unwrap(), added support for both mention formats (<@id> and <@!id>).",
+  "pr_url": "https://github.com/org/magpie/pull/144",
+  "plane_issue_id": "MAGPIE-44",
+  "ci_passed": true,
+  "rounds_used": 1,
+  "status": "Success"
+}
+```
+
+## Discord Bot Reply
+
+```
+✅ Done!
+
+PR: https://github.com/org/magpie/pull/144
+Branch: magpie/fix-empty-message-panic
+CI: Passed (1 round)
+Plane: MAGPIE-44
+
+Tests: 6 passed (3 new regression tests)
+```
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Total time | ~18 minutes |
+| Agent turns | ~10-14 (scan, investigate, plan, write test, fix) |
+| CI rounds | 0 (diagnostic lint+test already passed) |
+| Tier 1 calls | 2 (branch slug, commit message) |
+| Tier 2 calls | 5 (investigate, plan, write-test, fix, verify) |
+
+## Why Diagnostic Works
+
+1. **Forced investigation** — agent must explain WHY before fixing
+2. **Root cause analysis** — no band-aid fixes
+3. **Regression tests** — ensures the bug stays fixed
+4. **Read-only investigation** — separates analysis from implementation
+5. **Structured phases** — prevents "random fix attempts"
+
+Diagnostic tasks take ~18 minutes but produce deeper understanding and better fixes.

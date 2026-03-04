@@ -1,0 +1,400 @@
+---
+title: Two-Tier Agent Architecture
+description: Tier 1 for clean text generation, Tier 2 for full coding tasks
+---
+
+Magpie uses two tiers of LLM interaction, each optimized for its purpose. This architecture avoids forcing a single tool (Goose) to handle tasks it's not designed for.
+
+## Why Two Tiers?
+
+<CardGroup cols={2}>
+  <Card title="Tier 1: Simple Text" icon="message">
+    One-shot Claude CLI calls for branch names, classifications, commit messages
+  </Card>
+  <Card title="Tier 2: Coding Tasks" icon="code">
+    Full Goose agent loop with streaming and tool access for file edits
+  </Card>
+</CardGroup>
+
+<Note>
+Using Goose for simple text generation causes **streaming fragmentation** — tokens arrive split across multiple events, breaking single-line outputs like branch slugs. Tier 1 bypasses this by calling `claude -p` directly.
+</Note>
+
+## Tier 1: Claude CLI
+
+### When to Use
+
+- **Branch name generation:** `magpie/add-oauth2-login`
+- **Task classification:** `SIMPLE` | `STANDARD` | `BUGFIX`
+- **Commit messages:** `feat: add OAuth2 PKCE flow to auth module`
+
+### Implementation
+
+```rust title="pipeline.rs:1318-1352"
+async fn claude_call(prompt: &str, step_name: &str, trace_dir: Option<&PathBuf>) -> Result<String> {
+    let mut tb = TraceBuilder::new(step_name, prompt);
+
+    let output = tokio::process::Command::new("claude")
+        .args(["-p", prompt])
+        .env_remove("CLAUDECODE")
+        .output()
+        .await
+        .context("failed to run `claude` CLI — is it installed and on PATH?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tb.record_event(EventKind::Error, &stderr);
+        let trace = tb.finish("");
+        if let Some(dir) = trace_dir {
+            let _ = trace::write_trace(&trace, dir);
+        }
+        anyhow::bail!("claude CLI failed: {stderr}");
+    }
+
+    let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let trace = tb.finish(&response);
+    if let Some(dir) = trace_dir {
+        let _ = trace::write_trace(&trace, dir);
+    }
+
+    Ok(response)
+}
+```
+
+**Key features:**
+- Bypasses Goose entirely
+- Returns complete text in a single response
+- No streaming fragmentation
+- Traces calls to JSONL files
+
+### Example: Task Classification
+
+```rust title="pipeline.rs:201-229"
+info!(task, "ambiguous task → asking Claude to classify");
+let prompt = format!(
+    "Classify this task as either SIMPLE, STANDARD, or BUGFIX.\n\n\
+     SIMPLE = documentation changes, typo fixes, renames, formatting, trivial edits.\n\
+     STANDARD = new features, refactors, integrations, anything that needs tests.\n\
+     BUGFIX = fixing bugs, crashes, errors, regressions, investigating broken behavior.\n\n\
+     Task: {task}\n\n\
+     Reply with ONLY the word SIMPLE, STANDARD, or BUGFIX, nothing else."
+);
+
+match claude_call(&prompt, "classify", trace_dir).await {
+    Ok(response) => {
+        let upper = response.trim().to_uppercase();
+        if upper.contains("SIMPLE") {
+            info!(task, "agent classified as Simple");
+            TaskComplexity::Simple
+        } else if upper.contains("BUGFIX") {
+            info!(task, "agent classified as BugFix");
+            TaskComplexity::BugFix
+        } else {
+            info!(task, "agent classified as Standard (default for ambiguous)");
+            TaskComplexity::Standard
+        }
+    }
+    Err(e) => {
+        warn!(task, error = %e, "classification claude_call failed → defaulting to Standard");
+        TaskComplexity::Standard
+    }
+}
+```
+
+### Example: Branch Slug Generation
+
+```rust
+async fn generate_branch_slug(task: &str, trace_dir: Option<&PathBuf>) -> String {
+    let prompt = format!(
+        "Generate a short branch name slug (3-6 words, hyphen-separated) for this task.\n\n\
+         Task: {task}\n\n\
+         Reply with ONLY the slug, nothing else. Example: add-oauth2-pkce-flow"
+    );
+
+    match claude_call(&prompt, "branch-slug", trace_dir).await {
+        Ok(response) => {
+            let slug = response.trim().to_lowercase();
+            ensure_multi_word_slug(&slug, task)
+        }
+        Err(e) => {
+            warn!("branch slug generation failed: {e} → falling back to slugify");
+            crate::git::slugify(task)
+        }
+    }
+}
+```
+
+<Info>
+If Claude returns a single word like `"authentication"`, the pipeline enriches it by extracting a verb from the task: `"add-authentication"`. See `ensure_multi_word_slug()` in `pipeline.rs:1275-1312`.
+</Info>
+
+## Tier 2: MagpieAgent
+
+### When to Use
+
+- **File edits:** Reading source, modifying code, creating new files
+- **Shell commands:** Running tests, building projects, checking git status
+- **Multi-turn reasoning:** Planning, investigating bugs, implementing features
+
+### Configuration
+
+```rust title="agent.rs:13-32"
+#[derive(Debug, Clone)]
+pub struct MagpieConfig {
+    pub provider: String,
+    pub model: String,
+    pub max_turns: u32,
+    /// When set, agent calls are traced to JSONL files in this directory.
+    pub trace_dir: Option<PathBuf>,
+}
+
+impl Default for MagpieConfig {
+    fn default() -> Self {
+        Self {
+            provider: "claude-code".to_string(),
+            model: "default".to_string(),
+            max_turns: 10,
+            trace_dir: None,
+        }
+    }
+}
+```
+
+### Structure
+
+```rust title="agent.rs:34-51"
+pub struct MagpieAgent {
+    config: MagpieConfig,
+    agent: Agent,
+    session_manager: Arc<SessionManager>,
+}
+
+impl MagpieAgent {
+    pub fn new(config: MagpieConfig) -> Result<Self> {
+        let agent = Agent::new();
+        let session_manager = Arc::new(SessionManager::instance());
+        Ok(Self {
+            config,
+            agent,
+            session_manager,
+        })
+    }
+}
+```
+
+### Execution
+
+```rust title="agent.rs:60-145"
+pub async fn run(
+    &self,
+    prompt: &str,
+    working_dir: Option<&PathBuf>,
+    step_name: Option<&str>,
+) -> Result<String> {
+    if prompt.trim().is_empty() {
+        bail!("prompt must not be empty");
+    }
+
+    let step_label = step_name.unwrap_or("agent");
+    let mut tb = TraceBuilder::new(step_label, prompt);
+
+    // Create provider
+    let provider = create_with_named_model(
+        &self.config.provider,
+        &self.config.model,
+        Vec::<ExtensionConfig>::new(),
+    )
+    .await?;
+
+    // Create session — use caller-provided dir or fall back to process CWD
+    let working_dir = match working_dir {
+        Some(dir) => dir.clone(),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let session = self
+        .session_manager
+        .create_session(working_dir, "magpie".to_string(), SessionType::Hidden)
+        .await?;
+
+    // Wire provider to agent
+    self.agent.update_provider(provider, &session.id).await?;
+
+    let session_config = SessionConfig {
+        id: session.id.clone(),
+        schedule_id: None,
+        max_turns: Some(self.config.max_turns),
+        retry_config: None,
+    };
+
+    let user_message = Message::user().with_text(prompt);
+
+    let mut stream = self.agent.reply(user_message, session_config, None).await?;
+
+    // Collect assistant text from the stream, classifying events for tracing.
+    //
+    // The claude-code provider streams tokens as individual AgentEvent::Message
+    // events, so we concatenate directly — tokens already carry their own spacing
+    // (e.g. " the", " add").  Inserting newlines between fragments would corrupt
+    // single-line outputs like commit messages and branch slugs.
+    let mut response = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(AgentEvent::Message(msg)) => {
+                for content in msg.content.iter() {
+                    if let Some(text) = content.as_text() {
+                        response.push_str(text);
+                        tb.record_event(EventKind::Text, text);
+                    } else {
+                        // Classify non-text content for tracing
+                        let display = format!("{content}");
+                        if display.starts_with("[ToolRequest") {
+                            tb.record_event(EventKind::ToolRequest, &display);
+                        } else if display.starts_with("[ToolResponse") {
+                            tb.record_event(EventKind::ToolResponse, &display);
+                        } else if display.starts_with("[Thinking") {
+                            tb.record_event(EventKind::Thinking, &display);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tb.record_event(EventKind::Error, &e.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let call_trace = tb.finish(&response);
+    if let Some(ref dir) = self.config.trace_dir {
+        let _ = trace::write_trace(&call_trace, dir);
+    }
+
+    Ok(response)
+}
+```
+
+**Key features:**
+- Streams tokens for real-time progress
+- Full tool access (file read/write, shell exec)
+- Session management with working directory isolation
+- Multi-turn conversation support
+- Comprehensive event tracing
+
+### Integration with Blueprints
+
+Agent steps dispatch to `MagpieAgent` in local sandboxes:
+
+```rust title="blueprint/steps/agent.rs:49-119"
+pub async fn execute(
+    &self,
+    ctx: &StepContext,
+    step_name: &str,
+    sandbox: &dyn Sandbox,
+) -> Result<StepContext> {
+    let mut prompt = self.prompt.clone();
+
+    // Prepend metadata context (e.g. chat history) if configured
+    if let Some(ref key) = self.context_metadata_key {
+        if let Some(value) = ctx.metadata.get(key) {
+            prompt = format!("Context from conversation:\n```\n{value}\n```\n\n{prompt}");
+        }
+    }
+
+    if self.include_last_output {
+        if let Some(ref output) = ctx.last_output {
+            prompt = format!("Previous step output:\n```\n{output}\n```\n\n{prompt}");
+        }
+    }
+
+    let response = match sandbox.name() {
+        // Remote sandbox: agent can't use Goose locally, so exec `claude -p` inside the sandbox.
+        "daytona" => {
+            let max_turns = self.max_turns.unwrap_or(10);
+            let output = sandbox
+                .exec(
+                    "claude",
+                    &["-p", &prompt, "--max-turns", &max_turns.to_string()],
+                )
+                .await?;
+            if output.exit_code != 0 {
+                anyhow::bail!(
+                    "claude -p failed inside sandbox (exit {}): {}",
+                    output.exit_code,
+                    output.stdout.trim()
+                );
+            }
+            output.stdout.trim().to_string()
+        }
+        // Local sandbox: use the full Goose agent loop (current behavior).
+        _ => {
+            let mut config = MagpieConfig::default();
+            if let Some(turns) = self.max_turns {
+                config.max_turns = turns;
+            }
+
+            // Read trace_dir from context metadata (injected by pipeline)
+            if let Some(dir) = ctx.metadata.get("trace_dir") {
+                config.trace_dir = Some(PathBuf::from(dir));
+            }
+
+            let agent = MagpieAgent::new(config)?;
+            let working_dir = PathBuf::from(sandbox.working_dir());
+            agent
+                .run(&prompt, Some(&working_dir), Some(step_name))
+                .await?
+        }
+    };
+
+    let mut new_ctx = ctx.clone();
+    new_ctx.last_output = Some(response);
+    new_ctx.last_exit_code = Some(0);
+    Ok(new_ctx)
+}
+```
+
+<Note>
+**Remote sandbox behavior:** When running in a Daytona sandbox, agent steps exec `claude -p` inside the sandbox instead of using Goose locally. This ensures the agent has access to the sandbox's filesystem and tools.
+</Note>
+
+## Comparison
+
+| Aspect | Tier 1: Claude CLI | Tier 2: MagpieAgent |
+|--------|-------------------|---------------------|
+| **Invocation** | `tokio::process::Command` | Goose `Agent::reply()` |
+| **Streaming** | No (full response) | Yes (token-by-token) |
+| **Tool access** | None | File read/write, shell exec |
+| **Use cases** | Simple text generation | Complex coding tasks |
+| **Fragmentation risk** | None | Handled by stream collector |
+| **Tracing** | JSONL with prompt + response | JSONL with events (text, tools, thinking) |
+| **Working directory** | Current process CWD | Session-managed per call |
+
+## Design Rationale
+
+<AccordionGroup>
+  <Accordion title="Why not use Goose for everything?">
+    Goose streams tokens, which fragments single-line outputs. Branch slugs like `add-oauth2-login` arrive as separate events: `"add"`, `"-"`, `"oauth2"`, etc. This requires complex reassembly logic and still risks corruption.
+  </Accordion>
+  
+  <Accordion title="Why not use Claude CLI for everything?">
+    The Claude CLI doesn't have file or shell tool access. It can't read source code, run tests, or edit files. It's a pure text-in-text-out interface.
+  </Accordion>
+  
+  <Accordion title="Could we use the Claude API directly instead of CLI?">
+    Yes, but the CLI handles auth, rate limiting, and error retries for us. It's a simpler interface for one-shot calls.
+  </Accordion>
+  
+  <Accordion title="How does tracing work across both tiers?">
+    Both tiers use `TraceBuilder` to emit JSONL traces to `.magpie/traces/`. Each call records prompt, response, duration, and any errors. Tier 2 also records tool use events.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Blueprint Engine" icon="diagram-project" href="/concepts/blueprints">
+    See how Tier 2 agent steps integrate into blueprints
+  </Card>
+  <Card title="Sandbox Abstraction" icon="box" href="/concepts/sandbox">
+    Learn how sandboxes affect agent execution (local vs remote)
+  </Card>
+</CardGroup>

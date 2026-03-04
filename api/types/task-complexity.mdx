@@ -1,0 +1,285 @@
+---
+title: "TaskComplexity"
+description: "Classification enum that determines which blueprint path to execute"
+---
+
+## Overview
+
+`TaskComplexity` is a three-variant enum used by the pipeline to decide which blueprint to run. The classification happens in `classify_task()` using keyword matching and (for ambiguous cases) a Claude LLM call.
+
+Defined in `crates/magpie-core/src/pipeline.rs:94-102`.
+
+## Enum Definition
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskComplexity {
+    /// Docs, typos, renames — fast single-shot agent call.
+    Simple,
+    /// Features, refactors, integrations — TDD plan→test→implement flow.
+    Standard,
+    /// Bug fixes — diagnostic investigate→plan→test→fix flow.
+    BugFix,
+}
+```
+
+## Variants
+
+<ResponseField name="Simple" type="enum variant">
+  **Use Case:** Documentation changes, typo fixes, renames, trivial edits.
+  
+  **Blueprint:** `build_main_blueprint()` — single agent call with no CI integration inside the blueprint.
+  
+  **Keywords:** `fix typo`, `update readme`, `fix docs`, `update changelog`, `rename`, `fix comment`, `fix spelling`, `fix whitespace`, `fix formatting`, `update license`
+  
+  **Example Tasks:**
+  - "Fix typo in README"
+  - "Update docs for new API"
+  - "Rename `old_function` to `new_function`"
+</ResponseField>
+
+<ResponseField name="Standard" type="enum variant">
+  **Use Case:** New features, refactors, integrations, anything that needs tests.
+  
+  **Blueprint:** `build_tdd_blueprint()` — structured TDD flow:
+  1. Scan repo
+  2. Plan approach
+  3. Write tests (expect fail)
+  4. Verify tests fail (red phase)
+  5. Implement feature
+  6. Run tests (green phase)
+  7. Lint check
+  
+  **Keywords:** `add`, `implement`, `create`, `build`, `refactor`, `migrate`, `integrate`, `introduce`, `design`, `architect`, `extract`, `replace`, `rewrite`, `optimize`, `convert`
+  
+  **Example Tasks:**
+  - "Add health check endpoint"
+  - "Implement OAuth2 login"
+  - "Refactor database layer"
+  - "Integrate Stripe payments"
+</ResponseField>
+
+<ResponseField name="BugFix" type="enum variant">
+  **Use Case:** Fixing bugs, crashes, errors, regressions, investigating broken behavior.
+  
+  **Blueprint:** `build_diagnostic_blueprint()` — investigative flow:
+  1. Scan repo
+  2. **Investigate** root cause (no file modifications)
+  3. Plan targeted fix
+  4. Write regression test (expect fail)
+  5. Verify test fails
+  6. Implement fix
+  7. Run tests (expect pass)
+  8. Lint check
+  
+  **Keywords:** `fix bug`, `fix crash`, `fix error`, `fix panic`, `broken`, `not working`, `regression`, `debug`, `investigate`, `root cause`, `diagnose`
+  
+  **Example Tasks:**
+  - "Fix crash when user uploads empty file"
+  - "Fix broken authentication after last deploy"
+  - "Investigate why CI is failing on main"
+  - "Fix panic in parser"
+</ResponseField>
+
+## Classification Logic
+
+From `crates/magpie-core/src/pipeline.rs:170-230`:
+
+```rust
+pub async fn classify_task(
+    task: &str,
+    dry_run: bool,
+    trace_dir: Option<&PathBuf>,
+) -> TaskComplexity {
+    let lower = task.to_lowercase();
+
+    // 1. Simple keywords (checked first — "fix typo" is Simple, not BugFix)
+    if SIMPLE_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return TaskComplexity::Simple;
+    }
+
+    // 2. BugFix keywords
+    if BUGFIX_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return TaskComplexity::BugFix;
+    }
+
+    // 3. Standard keywords
+    if STANDARD_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return TaskComplexity::Standard;
+    }
+
+    // 4. Ambiguous — use Claude to classify (or default to Simple in dry_run)
+    if dry_run {
+        return TaskComplexity::Simple;
+    }
+
+    // Call Claude CLI with classification prompt
+    match claude_call(&prompt, "classify", trace_dir).await {
+        Ok(response) => {
+            let upper = response.trim().to_uppercase();
+            if upper.contains("SIMPLE") {
+                TaskComplexity::Simple
+            } else if upper.contains("BUGFIX") {
+                TaskComplexity::BugFix
+            } else {
+                TaskComplexity::Standard  // default for ambiguous
+            }
+        }
+        Err(_) => TaskComplexity::Standard,  // fallback on error
+    }
+}
+```
+
+### Keyword Priority
+
+1. **Simple** keywords are checked first ("fix typo" → Simple, not BugFix)
+2. **BugFix** keywords next
+3. **Standard** keywords last
+4. If no match, call Claude (Tier 1) for classification
+
+### Claude Prompt (Tier 1)
+
+For ambiguous tasks:
+
+```text
+Classify this task as either SIMPLE, STANDARD, or BUGFIX.
+
+SIMPLE = documentation changes, typo fixes, renames, formatting, trivial edits.
+STANDARD = new features, refactors, integrations, anything that needs tests.
+BUGFIX = fixing bugs, crashes, errors, regressions, investigating broken behavior.
+
+Task: <user task>
+
+Reply with ONLY the word SIMPLE, STANDARD, or BUGFIX, nothing else.
+```
+
+If the LLM call fails, defaults to `Standard`.
+
+## Blueprint Mapping
+
+| Complexity | Blueprint | Key Characteristics |
+|------------|-----------|---------------------|
+| **Simple** | `build_main_blueprint` | Single agent call, no structured phases |
+| **Standard** | `build_tdd_blueprint` | Plan → Write Tests → Verify Fail → Implement → Test → Lint |
+| **BugFix** | `build_diagnostic_blueprint` | Investigate (read-only) → Plan → Test → Verify Fail → Fix → Test → Lint |
+
+## Usage Example
+
+### Manual Classification
+
+```rust
+use magpie_core::pipeline::{classify_task, TaskComplexity};
+
+let complexity = classify_task(
+    "add health check endpoint",
+    false,  // not dry_run
+    None,   // no trace_dir
+).await;
+
+assert_eq!(complexity, TaskComplexity::Standard);  // matches "add" keyword
+```
+
+### Using Classification in Pipeline
+
+```rust
+let complexity = classify_task(task, config.dry_run, config.trace_dir.as_ref()).await;
+
+let (blueprint, ctx) = match complexity {
+    TaskComplexity::Simple => build_main_blueprint(&trigger, config, &working_dir)?,
+    TaskComplexity::Standard => build_tdd_blueprint(&trigger, config, &working_dir)?,
+    TaskComplexity::BugFix => build_diagnostic_blueprint(&trigger, config, &working_dir)?,
+};
+
+let result = BlueprintRunner::new(ctx, &*sandbox).run(&blueprint).await?;
+```
+
+### Testing with Dry Run
+
+```rust
+// In dry_run mode, ambiguous tasks default to Simple (skips LLM call)
+let complexity = classify_task(
+    "do something",  // ambiguous
+    true,  // dry_run
+    None,
+).await;
+
+assert_eq!(complexity, TaskComplexity::Simple);
+```
+
+## Keyword Reference
+
+### SIMPLE_KEYWORDS
+
+```rust
+[
+    "fix typo", "fix the typo",
+    "update readme", "update the readme",
+    "fix docs", "fix the docs",
+    "update docs", "update the docs",
+    "update changelog", "update the changelog",
+    "rename",
+    "fix comment", "fix comments",
+    "fix spelling", "fix whitespace", "fix formatting",
+    "update license", "fix license",
+]
+```
+
+### BUGFIX_KEYWORDS
+
+```rust
+[
+    "fix bug", "fix the bug",
+    "fix crash", "fix the crash",
+    "fix error", "fix the error",
+    "fix panic", "fix the panic",
+    "broken", "not working",
+    "regression", "debug",
+    "investigate", "root cause", "diagnose",
+]
+```
+
+### STANDARD_KEYWORDS
+
+```rust
+[
+    "add", "implement", "create", "build",
+    "refactor", "migrate", "integrate", "introduce",
+    "design", "architect",
+    "extract", "replace", "rewrite",
+    "optimize", "convert",
+]
+```
+
+## Design Rationale
+
+### Why "Simple" First?
+
+"Fix typo" contains "fix", which is a BugFix keyword. But typo fixes are trivial docs changes, not bugs. By checking Simple keywords first, we ensure "fix typo" → Simple, not BugFix.
+
+### Why Default to Standard?
+
+When Claude fails to classify or returns an unexpected response, we default to `Standard` (TDD flow). This is the safest choice:
+- Standard includes test writing, which catches regressions
+- BugFix flow assumes broken behavior exists (may not be true)
+- Simple flow has no safety net (no tests)
+
+### Why Three Tiers?
+
+Magpie uses a **two-tier LLM architecture**:
+- **Tier 1** (Claude CLI): Fast single-response text generation (classification, branch names, commit messages)
+- **Tier 2** (Goose agent): Full streaming + tool use for all coding work
+
+Classification is Tier 1 because it's a simple text-in/text-out decision that doesn't need tools.
+
+## Notes
+
+- **Case Insensitive:** Keywords are matched against `task.to_lowercase()`.
+- **Substring Match:** `"fix typo in README"` matches because it contains `"fix typo"`.
+- **Serialization:** `TaskComplexity` derives `Serialize`/`Deserialize` for logging and telemetry.
+- **Thread Safe:** `Copy` trait means no allocation, safe to pass by value.
+
+## See Also
+
+- [Blueprint](/api/types/blueprint) — The orchestration structure selected based on complexity
+- [PipelineConfig](/api/types/pipeline-config) — Pipeline configuration (includes `dry_run` flag)
+- [PipelineResult](/api/types/pipeline-result) — Output from the pipeline after blueprint execution

@@ -1,0 +1,674 @@
+---
+title: Installation
+description: Complete guide to installing and configuring Magpie for autonomous AI coding
+---
+
+Magpie is a Rust workspace with four crates. This guide covers installation, prerequisites, build process, and environment configuration.
+
+## System requirements
+
+<CardGroup cols={2}>
+  <Card title="Operating System" icon="desktop">
+    - **Linux**: Ubuntu 20.04+, Debian 11+, or equivalent
+    - **macOS**: 12 (Monterey) or later
+    - **Windows**: WSL2 recommended
+  </Card>
+  
+  <Card title="Hardware" icon="microchip">
+    - **CPU**: x86_64 or ARM64
+    - **RAM**: 4GB minimum, 8GB recommended
+    - **Disk**: 2GB for build artifacts
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+Install these tools before building Magpie:
+
+### Rust 1.75+
+
+<Steps>
+  <Step title="Install rustup">
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+    
+    Follow the interactive prompts to complete installation.
+  </Step>
+
+  <Step title="Configure your PATH">
+    Add Cargo's bin directory to your shell profile:
+    
+    ```bash
+    # For bash
+    echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+    source ~/.bashrc
+    
+    # For zsh
+    echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+    source ~/.zshrc
+    ```
+  </Step>
+
+  <Step title="Verify installation">
+    ```bash
+    rustc --version
+    # Should output: rustc 1.75.0 or higher
+    
+    cargo --version
+    # Should output: cargo 1.75.0 or higher
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  Rust releases every 6 weeks. Keep up to date with `rustup update`.
+</Tip>
+
+### Claude CLI
+
+The Claude CLI powers both Tier 1 (text generation) and Tier 2 (Goose agent) LLM calls.
+
+<Steps>
+  <Step title="Install Claude CLI">
+    Follow the official [Claude Code documentation](https://docs.anthropic.com/en/docs/claude-code) to install the CLI for your platform.
+  </Step>
+
+  <Step title="Authenticate">
+    Run `claude` interactively to complete authentication:
+    
+    ```bash
+    claude
+    ```
+    
+    You'll be prompted to log in via your browser.
+  </Step>
+
+  <Step title="Test with a prompt">
+    ```bash
+    claude -p "Say hello in one word"
+    # Should output: Hello
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Magpie requires the Claude CLI to be authenticated. The pipeline will fail if `claude -p` doesn't work.
+</Warning>
+
+### Git and GitHub CLI
+
+Git handles branch operations. The GitHub CLI (`gh`) automates PR creation.
+
+<Tabs>
+  <Tab title="macOS">
+    ```bash
+    # Git is pre-installed on macOS
+    git --version
+    
+    # Install GitHub CLI
+    brew install gh
+    ```
+  </Tab>
+  
+  <Tab title="Linux (Debian/Ubuntu)">
+    ```bash
+    # Install Git
+    sudo apt update
+    sudo apt install git
+    
+    # Install GitHub CLI
+    sudo apt install gh
+    ```
+  </Tab>
+  
+  <Tab title="Linux (Fedora/RHEL)">
+    ```bash
+    # Install Git
+    sudo dnf install git
+    
+    # Install GitHub CLI
+    sudo dnf install gh
+    ```
+  </Tab>
+  
+  <Tab title="Windows (WSL2)">
+    ```bash
+    # Inside WSL2
+    sudo apt update
+    sudo apt install git gh
+    ```
+  </Tab>
+</Tabs>
+
+<Steps>
+  <Step title="Authenticate with GitHub">
+    ```bash
+    gh auth login
+    ```
+    
+    Follow the prompts to authenticate via browser or token.
+  </Step>
+
+  <Step title="Verify access">
+    ```bash
+    gh repo view
+    # Should show details of the current repository
+    ```
+  </Step>
+</Steps>
+
+### Optional: C++ compiler
+
+Required for building Goose dependencies (candle, llama-cpp).
+
+<Tabs>
+  <Tab title="macOS">
+    ```bash
+    xcode-select --install
+    ```
+  </Tab>
+  
+  <Tab title="Linux (Debian/Ubuntu)">
+    ```bash
+    sudo apt install build-essential
+    ```
+  </Tab>
+  
+  <Tab title="Linux (Fedora/RHEL)">
+    ```bash
+    sudo dnf groupinstall "Development Tools"
+    ```
+  </Tab>
+</Tabs>
+
+## Build Magpie
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/your-org/magpie.git
+    cd magpie
+    ```
+  </Step>
+
+  <Step title="Build all crates">
+    ```bash
+    cargo build --release
+    ```
+    
+    <Info>
+      **First build timing**: 4-5 minutes due to Goose transitive dependencies (candle, llama-cpp, tree-sitter). Subsequent builds are much faster thanks to Cargo's incremental compilation.
+    </Info>
+    
+    This builds all four crates:
+    - `magpie-core` (library)
+    - `magpie-cli` (binary)
+    - `magpie-discord` (binary)
+    - `magpie-teams` (binary)
+  </Step>
+
+  <Step title="Verify binaries">
+    ```bash
+    ls -lh target/release/magpie-*
+    # Should show: magpie-cli, magpie-discord, magpie-teams
+    
+    ./target/release/magpie-cli --help
+    ```
+  </Step>
+</Steps>
+
+### Build individual crates
+
+To build only specific crates:
+
+<CodeGroup>
+```bash CLI only
+cargo build --release -p magpie-cli
+```
+
+```bash Discord bot
+cargo build --release -p magpie-discord
+```
+
+```bash Core library
+cargo build --release -p magpie-core
+```
+
+```bash With Daytona support
+cargo build --release -p magpie-core --features daytona
+```
+</CodeGroup>
+
+## Run tests
+
+<Steps>
+  <Step title="Run fast tests">
+    ```bash
+    cargo test
+    ```
+    
+    This runs unit tests that don't require external services.
+  </Step>
+
+  <Step title="Run integration tests (optional)">
+    Some tests are marked `#[ignore]` because they require the `claude` CLI or a real git repository:
+    
+    ```bash
+    cargo test -- --ignored
+    ```
+    
+    <Warning>
+      Integration tests make real API calls and may take several minutes.
+    </Warning>
+  </Step>
+
+  <Step title="Test specific crate">
+    ```bash
+    cargo test -p magpie-core
+    ```
+  </Step>
+
+  <Step title="Run a single test">
+    ```bash
+    cargo test -p magpie-core test_slug
+    ```
+  </Step>
+</Steps>
+
+## Configuration
+
+Magpie is configured entirely via environment variables. All adapters (CLI, Discord, Teams) read from the same variables.
+
+### Core pipeline settings
+
+<ParamField path="MAGPIE_REPO_DIR" type="string" default=". (cwd)">
+  Path to the git repository to operate on. The agent's file operations and git commands target this directory.
+  
+  ```bash
+  export MAGPIE_REPO_DIR="/Users/you/code/api-service"
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_BASE_BRANCH" type="string" default="main">
+  Base branch for new feature branches. Magpie creates branches like `magpie/{slug}` from this branch.
+  
+  ```bash
+  export MAGPIE_BASE_BRANCH="main"
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_TEST_CMD" type="string" default="cargo test">
+  Command to run tests during the CI loop. Customize for your project's test runner.
+  
+  ```bash
+  export MAGPIE_TEST_CMD="npm test"
+  export MAGPIE_TEST_CMD="pytest tests/"
+  export MAGPIE_TEST_CMD="go test ./..."
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_LINT_CMD" type="string" default="cargo clippy">
+  Command to run lints during the CI loop.
+  
+  ```bash
+  export MAGPIE_LINT_CMD="npm run lint"
+  export MAGPIE_LINT_CMD="ruff check ."
+  export MAGPIE_LINT_CMD="golangci-lint run"
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_MAX_CI_ROUNDS" type="integer" default="2">
+  Maximum lint → test → fix retries. After this many rounds, the pipeline returns `PartialSuccess` status.
+  
+  ```bash
+  export MAGPIE_MAX_CI_ROUNDS="3"
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_GITHUB_ORG" type="string" default="None">
+  GitHub organization to restrict repo access. When set, the pipeline resolves the target repo from the task message and clones it into a temp workspace.
+  
+  ```bash
+  export MAGPIE_GITHUB_ORG="your-company"
+  ```
+  
+  <Info>
+    This enables multi-repo support. Example task: `"fix bug in api-service"` → Magpie clones `your-company/api-service`.
+  </Info>
+</ParamField>
+
+### Plane integration (optional)
+
+Connect to a self-hosted [Plane](https://plane.so) instance for issue tracking:
+
+<ParamField path="PLANE_BASE_URL" type="string" required>
+  URL of your Plane instance.
+  
+  ```bash
+  export PLANE_BASE_URL="https://plane.yourcompany.com"
+  ```
+</ParamField>
+
+<ParamField path="PLANE_API_KEY" type="string" required>
+  Plane API key for authentication.
+  
+  ```bash
+  export PLANE_API_KEY="your-api-key-here"
+  ```
+</ParamField>
+
+<ParamField path="PLANE_WORKSPACE_SLUG" type="string" required>
+  Workspace slug where issues will be created.
+  
+  ```bash
+  export PLANE_WORKSPACE_SLUG="engineering"
+  ```
+</ParamField>
+
+<ParamField path="PLANE_PROJECT_ID" type="string" required>
+  Project ID for auto-created issues.
+  
+  ```bash
+  export PLANE_PROJECT_ID="proj-123abc"
+  ```
+</ParamField>
+
+### Discord bot (optional)
+
+Run Magpie as a Discord bot that responds to `@magpie` mentions:
+
+<ParamField path="DISCORD_TOKEN" type="string" required>
+  Discord bot token from the [Discord Developer Portal](https://discord.com/developers/applications).
+  
+  ```bash
+  export DISCORD_TOKEN="your-discord-bot-token"
+  ```
+</ParamField>
+
+**Run the Discord bot**:
+
+```bash
+cargo run --release -p magpie-discord
+```
+
+<Tip>
+  The Discord adapter creates a new thread for each task and archives it after the pipeline completes.
+</Tip>
+
+### Teams webhook (optional)
+
+Run Magpie as a Microsoft Teams webhook:
+
+<ParamField path="TEAMS_APP_ID" type="string" required>
+  Bot Framework app ID.
+  
+  ```bash
+  export TEAMS_APP_ID="your-app-id"
+  ```
+</ParamField>
+
+<ParamField path="TEAMS_APP_SECRET" type="string" required>
+  Bot Framework app secret.
+  
+  ```bash
+  export TEAMS_APP_SECRET="your-app-secret"
+  ```
+</ParamField>
+
+<ParamField path="TEAMS_LISTEN_ADDR" type="string" default="0.0.0.0:3978">
+  Address for the webhook server.
+  
+  ```bash
+  export TEAMS_LISTEN_ADDR="0.0.0.0:8080"
+  ```
+</ParamField>
+
+**Run the Teams webhook**:
+
+```bash
+cargo run --release -p magpie-teams
+```
+
+### Daytona sandbox (optional)
+
+Execute pipeline commands in remote [Daytona](https://daytona.io) sandboxes:
+
+<ParamField path="DAYTONA_API_KEY" type="string" required>
+  Daytona API key.
+  
+  ```bash
+  export DAYTONA_API_KEY="your-api-key"
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_BASE_URL" type="string" default="https://app.daytona.io/api">
+  Daytona API base URL.
+  
+  ```bash
+  export DAYTONA_BASE_URL="https://daytona.yourcompany.com/api"
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_ORGANIZATION_ID" type="string">
+  Organization ID for multi-tenant Daytona instances.
+  
+  ```bash
+  export DAYTONA_ORGANIZATION_ID="org-123abc"
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_SANDBOX_CLASS" type="string" default="small">
+  Sandbox size class (`small`, `medium`, `large`).
+  
+  ```bash
+  export DAYTONA_SANDBOX_CLASS="medium"
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_SNAPSHOT_NAME" type="string">
+  Pre-built snapshot to use for faster sandbox creation.
+  
+  ```bash
+  export DAYTONA_SNAPSHOT_NAME="rust-1.75-ubuntu"
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_ENV" type="string">
+  Comma-separated `KEY=VALUE` pairs to inject into the sandbox environment.
+  
+  ```bash
+  export DAYTONA_ENV="RUST_LOG=debug,CARGO_TERM_COLOR=always"
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_VOLUME_ID" type="string">
+  Persistent volume ID to mount in the sandbox.
+  
+  ```bash
+  export DAYTONA_VOLUME_ID="vol-123abc"
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_VOLUME_MOUNT_PATH" type="string">
+  Path where the volume should be mounted.
+  
+  ```bash
+  export DAYTONA_VOLUME_MOUNT_PATH="/mnt/data"
+  ```
+</ParamField>
+
+**Build with Daytona support**:
+
+```bash
+cargo build --release -p magpie-core --features daytona
+```
+
+## Using a .env file
+
+Instead of exporting variables manually, create a `.env` file:
+
+```bash .env
+# Core pipeline
+MAGPIE_REPO_DIR=/Users/you/code/api-service
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy -- -D warnings"
+MAGPIE_MAX_CI_ROUNDS=2
+
+# Optional: GitHub org
+MAGPIE_GITHUB_ORG=your-company
+
+# Optional: Plane
+PLANE_BASE_URL=https://plane.yourcompany.com
+PLANE_API_KEY=your-api-key
+PLANE_WORKSPACE_SLUG=engineering
+PLANE_PROJECT_ID=proj-123abc
+
+# Optional: Discord
+DISCORD_TOKEN=your-discord-token
+
+# Optional: Daytona
+DAYTONA_API_KEY=your-daytona-key
+DAYTONA_SANDBOX_CLASS=medium
+```
+
+Magpie automatically loads `.env` from the current directory via `dotenvy::dotenv()` at startup.
+
+<Tip>
+  Add `.env` to `.gitignore` to avoid committing secrets.
+</Tip>
+
+## Verify installation
+
+Run these commands to ensure everything is configured correctly:
+
+<Steps>
+  <Step title="Test single prompt">
+    ```bash
+    ./target/release/magpie-cli "Say hello"
+    ```
+    
+    Should return a greeting from the agent.
+  </Step>
+
+  <Step title="Test blueprint demo">
+    ```bash
+    ./target/release/magpie-cli --demo
+    ```
+    
+    Should list files and summarize them.
+  </Step>
+
+  <Step title="Dry-run the pipeline">
+    Create a test repository:
+    
+    ```bash
+    mkdir /tmp/magpie-test
+    cd /tmp/magpie-test
+    git init
+    git config user.name "Test User"
+    git config user.email "test@example.com"
+    echo "# Test" > README.md
+    git add README.md
+    git commit -m "Initial commit"
+    ```
+    
+    Run a simple task:
+    
+    ```bash
+    MAGPIE_REPO_DIR=/tmp/magpie-test \
+    MAGPIE_TEST_CMD="echo 'tests pass'" \
+    MAGPIE_LINT_CMD="echo 'lints pass'" \
+      ./target/release/magpie-cli --pipeline "add a hello world file"
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  For production deployments, see [Deployment Guide](/deployment) for Docker, Kubernetes, and systemd configurations.
+</Note>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Build error: linking with `cc` failed">
+    Install a C++ compiler:
+    
+    ```bash
+    # macOS
+    xcode-select --install
+    
+    # Linux (Debian/Ubuntu)
+    sudo apt install build-essential
+    
+    # Linux (Fedora/RHEL)
+    sudo dnf groupinstall "Development Tools"
+    ```
+  </Accordion>
+
+  <Accordion title="Error: claude: command not found">
+    The Claude CLI is not installed or not in your PATH. Follow the [Claude Code setup guide](https://docs.anthropic.com/en/docs/claude-code).
+  </Accordion>
+
+  <Accordion title="Error: gh: command not found">
+    Install the GitHub CLI:
+    
+    ```bash
+    # macOS
+    brew install gh
+    
+    # Linux (Debian/Ubuntu)
+    sudo apt install gh
+    ```
+    
+    Then authenticate: `gh auth login`
+  </Accordion>
+
+  <Accordion title="Pipeline fails with 'not a git repository'">
+    Ensure `MAGPIE_REPO_DIR` points to a valid git repository:
+    
+    ```bash
+    cd $MAGPIE_REPO_DIR
+    git status
+    ```
+  </Accordion>
+
+  <Accordion title="Tests hang or timeout">
+    Some integration tests make real API calls. Skip them:
+    
+    ```bash
+    cargo test --lib
+    ```
+  </Accordion>
+
+  <Accordion title="Discord bot doesn't respond to mentions">
+    Verify the bot has these permissions in your Discord server:
+    - Read Messages/View Channels
+    - Send Messages
+    - Create Public Threads
+    - Manage Threads
+    
+    Check the bot token is correct: `echo $DISCORD_TOKEN`
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first end-to-end pipeline
+  </Card>
+  
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand Magpie's two-tier agent system and blueprint engine
+  </Card>
+  
+  <Card title="Chat adapters" icon="comments" href="/adapters/discord">
+    Set up Discord or Teams integrations
+  </Card>
+  
+  <Card title="API reference" icon="code" href="/api/pipeline">
+    Explore the programmatic API
+  </Card>
+</CardGroup>

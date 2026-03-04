@@ -1,0 +1,353 @@
+---
+title: 'Organization-Scoped Repositories'
+description: 'Dynamic repo resolution and multi-repo pipeline execution'
+---
+
+## Overview
+
+Magpie supports **dynamic repository resolution** through the `MAGPIE_GITHUB_ORG` environment variable. When enabled, the pipeline parses the target repository name directly from the user's task message, validates it belongs to the allowed GitHub organization, clones it into a temporary workspace, and executes the pipeline.
+
+This enables a single Magpie deployment to service multiple repositories within an organization without hardcoding repo paths.
+
+## Configuration
+
+### Environment Variable
+
+Set `MAGPIE_GITHUB_ORG` to restrict repo access to a specific GitHub organization:
+
+```bash
+export MAGPIE_GITHUB_ORG="myorg"
+```
+
+When this variable is set, Magpie will:
+1. Parse the repo name from the task message
+2. Validate it belongs to `myorg`
+3. Clone `myorg/repo-name` into a temporary sandbox
+4. Execute the pipeline in that workspace
+5. Clean up the temporary directory on completion
+
+### Validation Rules
+
+Magpie enforces strict org-scoping to prevent unauthorized access:
+
+<CodeGroup>
+```rust repo.rs:114
+pub fn validate_org(full_name: &str, org: &str) -> anyhow::Result<()> {
+    let expected_prefix = format!("{org}/");
+    if !full_name.starts_with(&expected_prefix) {
+        anyhow::bail!(
+            "repo '{full_name}' does not belong to org '{org}' (expected prefix '{expected_prefix}')"
+        );
+    }
+    let repo_part = &full_name[expected_prefix.len()..];
+    if repo_part.is_empty() {
+        anyhow::bail!("repo name is empty after org prefix '{expected_prefix}'");
+    }
+    Ok(())
+}
+```
+</CodeGroup>
+
+- **Case-sensitive**: `MyOrg/repo` does NOT match `myorg/repo`
+- **Exact prefix match**: `myorgx/repo` does NOT match when org is `myorg`
+- **No bare names**: `api-service` is rejected (must be `myorg/api-service`)
+
+## Message Parsing
+
+### Recognized Patterns
+
+Magpie recognizes two natural language patterns for specifying the target repository:
+
+<CardGroup cols={2}>
+  <Card title="in <repo>" icon="arrow-right">
+    "fix login bug **in api-service**"
+    
+    Extracts: `api-service`
+  </Card>
+  <Card title="repo <name>" icon="code-branch">
+    "fix bug **repo api-service**"
+    
+    Extracts: `api-service`
+  </Card>
+</CardGroup>
+
+### With Org Prefix
+
+Users can optionally include the org prefix — Magpie strips it during parsing:
+
+```bash
+"fix bug in myorg/api-service"  # Parses as: api-service
+"deploy repo myorg/api-service" # Parses as: api-service
+```
+
+The org prefix in the message is used for validation. If a user explicitly specifies a different org (e.g., `evil-org/api-service`), the pipeline fails with a setup error.
+
+### Noise Filtering
+
+Magpie filters out common noise words after "in" to avoid false matches:
+
+<CodeGroup>
+```rust repo.rs:28
+const NOISE_WORDS: &[&str] = &[
+    "the", "a", "an", "this", "that", "my", "our", "your", "its",
+    "some", "any", "code", "project", "codebase", "app", "application",
+];
+```
+</CodeGroup>
+
+<Tip>
+**Valid repo names must:**
+- Start with an alphanumeric character
+- Contain only `a-z`, `A-Z`, `0-9`, `-`, `_`, `.`
+- Be at least 1 character long
+
+Examples: `api-service`, `auth_module`, `web.app`
+</Tip>
+
+## Implementation Details
+
+### Parsing Logic
+
+The parser performs two passes over the task message:
+
+<Steps>
+  <Step title="Pass 1: 'repo' keyword">
+    Searches for `repo <name>` and extracts the next token if it's a valid repo name.
+  </Step>
+  <Step title="Pass 2: 'in' keyword">
+    Searches for `in <name>`, skipping noise words, and extracts the next token.
+  </Step>
+</Steps>
+
+<CodeGroup>
+```rust repo.rs:79
+pub fn parse_repo_from_message(message: &str) -> Option<String> {
+    let words: Vec<&str> = message.trim().split_whitespace().collect();
+
+    // Pass 1: look for "repo <name>" pattern
+    for (i, word) in words.iter().enumerate() {
+        if word.eq_ignore_ascii_case("repo") {
+            if let Some(&next) = words.get(i + 1) {
+                let name = strip_org_prefix(next);
+                if is_repo_name(name) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+
+    // Pass 2: look for "in <name>" pattern (skip noise words)
+    for (i, word) in words.iter().enumerate() {
+        if word.eq_ignore_ascii_case("in") {
+            if let Some(&next) = words.get(i + 1) {
+                let name = strip_org_prefix(next);
+                if is_repo_name(name) && !NOISE_WORDS.contains(&name.to_lowercase().as_str()) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+```
+</CodeGroup>
+
+### Cloning
+
+Magpie clones repositories using the GitHub CLI (`gh repo clone`):
+
+<CodeGroup>
+```rust repo.rs:171
+pub fn clone_repo(repo_name: &str, org: &str) -> anyhow::Result<ResolvedRepo> {
+    let full_name = format!("{org}/{repo_name}");
+    let temp_dir = tempfile::tempdir()?;
+    let clone_target = temp_dir.path().join(repo_name);
+
+    let output = std::process::Command::new("gh")
+        .args(["repo", "clone", &full_name, clone_target.to_str().unwrap()])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh repo clone failed for '{full_name}': {stderr}");
+    }
+
+    Ok(ResolvedRepo {
+        full_name,
+        repo_dir: clone_target,
+        _temp_dir: temp_dir,
+    })
+}
+```
+</CodeGroup>
+
+### Automatic Cleanup
+
+The `ResolvedRepo` struct owns a `tempfile::TempDir` that is automatically cleaned up when the pipeline completes:
+
+<CodeGroup>
+```rust repo.rs:16
+pub struct ResolvedRepo {
+    pub full_name: String,
+    pub repo_dir: PathBuf,
+    /// The temp directory that owns the clone. Dropped → cleaned up.
+    _temp_dir: tempfile::TempDir,
+}
+```
+</CodeGroup>
+
+When `ResolvedRepo` is dropped (end of pipeline), the temporary directory and all cloned files are deleted.
+
+## Pipeline Integration
+
+### Sandbox Creation
+
+When `github_org` is set in `PipelineConfig`, the pipeline creates the sandbox differently:
+
+<CodeGroup>
+```rust pipeline.rs:754
+let sandbox: Box<dyn Sandbox> = if let Some(ref org) = config.github_org {
+    // Parse repo from message
+    let repo_name = match repo::parse_repo_from_message(task) {
+        Some(name) => name,
+        None => {
+            return Ok(PipelineResult {
+                output: "Setup failed: could not identify a target repo in the message. Specify the repo with 'in <repo>' or 'repo <name>'.".to_string(),
+                status: PipelineStatus::SetupFailed,
+                // ...
+            });
+        }
+    };
+
+    // Validate org
+    let full_name = format!("{org}/{repo_name}");
+    if let Err(e) = repo::validate_org(&full_name, org) {
+        return Ok(PipelineResult {
+            output: format!("Setup failed: {e}"),
+            status: PipelineStatus::SetupFailed,
+            // ...
+        });
+    }
+
+    // Clone into sandbox (Daytona or Local)
+    // ...
+} else {
+    Box::new(LocalSandbox::from_path(config.repo_dir.clone()))
+};
+```
+</CodeGroup>
+
+## Example Usage
+
+### Discord Bot
+
+```bash
+export MAGPIE_GITHUB_ORG="block"
+export REPO_DIR="."  # ignored when org-scoping is enabled
+cargo run -p magpie-discord
+```
+
+Users send messages like:
+- `"fix the CI flakiness in goose"`
+- `"add health check endpoint repo api-service"`
+- `"update README in block/web-app"`
+
+Magpie resolves the target repo, clones it, and opens a PR.
+
+### CLI (Single-Repo Mode)
+
+```bash
+# Without org-scoping (uses REPO_DIR)
+unset MAGPIE_GITHUB_ORG
+export REPO_DIR="/path/to/my-repo"
+cargo run -p magpie-cli -- --pipeline "add OAuth2 support"
+```
+
+### Security Considerations
+
+<Warning>
+Org-scoped mode requires the `gh` CLI to be authenticated with a token that has read access to all repositories in the specified org. Use a fine-grained PAT with minimal permissions:
+
+```bash
+gh auth login --scopes repo
+```
+
+If using Daytona sandboxes, inject the `GH_TOKEN` via `DAYTONA_ENV` so sandboxes can clone private repos.
+</Warning>
+
+## Error Handling
+
+### Setup Failures
+
+The pipeline returns `PipelineStatus::SetupFailed` when:
+
+<AccordionGroup>
+  <Accordion title="No repo found in message">
+    ```json
+    {
+      "output": "Setup failed: could not identify a target repo in the message. Specify the repo with 'in <repo>' or 'repo <name>'.",
+      "status": "SetupFailed",
+      "ci_passed": false,
+      "rounds_used": 0
+    }
+    ```
+    
+    **Fix:** Update the task message to include `in <repo-name>` or `repo <repo-name>`.
+  </Accordion>
+  
+  <Accordion title="Org validation failed">
+    ```json
+    {
+      "output": "Setup failed: repo 'evil-org/api-service' does not belong to org 'myorg'",
+      "status": "SetupFailed"
+    }
+    ```
+    
+    **Fix:** Remove the org prefix from the message, or ensure `MAGPIE_GITHUB_ORG` matches the intended org.
+  </Accordion>
+  
+  <Accordion title="Clone failed">
+    ```json
+    {
+      "output": "Setup failed: could not clone myorg/api-service: repository not found",
+      "status": "SetupFailed"
+    }
+    ```
+    
+    **Fix:** Verify the repo exists, `gh` is authenticated, and the token has read access.
+  </Accordion>
+</AccordionGroup>
+
+## Testing
+
+The `repo.rs` module includes comprehensive tests:
+
+```bash
+cargo test -p magpie-core -- repo
+```
+
+Key test cases:
+- ✅ `test_parse_repo_from_message_in_pattern`
+- ✅ `test_parse_repo_from_message_with_org_prefix`
+- ✅ `test_parse_repo_from_message_ignores_noise_words`
+- ✅ `test_validate_org_accepts_correct_org`
+- ✅ `test_validate_org_rejects_wrong_org`
+- ✅ `test_validate_org_case_sensitive`
+
+Integration tests (require `gh` CLI + network):
+
+```bash
+cargo test -p magpie-core -- repo --ignored
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Daytona Integration" icon="cloud" href="/advanced/daytona-integration">
+    Use remote sandboxes for org-scoped repos
+  </Card>
+  <Card title="Warm Pool" icon="layer-group" href="/advanced/daytona-integration#warm-sandbox-pool">
+    Pre-provision sandboxes for faster acquisition
+  </Card>
+</CardGroup>

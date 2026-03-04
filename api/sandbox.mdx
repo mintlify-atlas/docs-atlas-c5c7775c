@@ -1,0 +1,288 @@
+---
+title: Sandbox
+description: Abstraction for executing commands in isolated environments.
+---
+
+## Overview
+
+The `Sandbox` trait provides an abstraction for where commands execute and files live. Each pipeline run creates its own `Box<dyn Sandbox>`, providing full isolation between concurrent runs.
+
+Magpie includes two built-in implementations:
+- **LocalSandbox**: Runs commands locally via `std::process::Command` (current behavior)
+- **DaytonaSandbox**: Runs commands in a remote Daytona sandbox via REST API (feature-flagged)
+
+## Trait Definition
+
+```rust
+use anyhow::Result;
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait Sandbox: Send + Sync {
+    fn name(&self) -> &str;
+    fn working_dir(&self) -> &str;
+    async fn exec(&self, command: &str, args: &[&str]) -> Result<ExecOutput>;
+    async fn exec_shell(&self, shell_cmd: &str) -> Result<ExecOutput> {
+        self.exec("sh", &["-c", shell_cmd]).await
+    }
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>>;
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
+    async fn destroy(&self) -> Result<()>;
+}
+```
+
+## Types
+
+### ExecOutput
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+impl ExecOutput {
+    /// Combine stdout and stderr, preferring whichever is non-empty.
+    pub fn combined(&self) -> String {
+        if self.stderr.is_empty() {
+            self.stdout.clone()
+        } else if self.stdout.is_empty() {
+            self.stderr.clone()
+        } else {
+            format!("{}\n{}", self.stdout, self.stderr)
+        }
+    }
+}
+```
+
+### DaytonaConfig
+
+```rust
+#[derive(Debug, Clone)]
+pub struct DaytonaConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub organization_id: Option<String>,
+    pub sandbox_class: String,
+    /// Daytona snapshot name to create sandboxes from (pre-built image).
+    pub snapshot_name: Option<String>,
+    /// Environment variables to inject into the sandbox at creation time.
+    pub env_vars: std::collections::HashMap<String, String>,
+    /// Persistent volume ID for build cache (e.g. cargo target dir).
+    pub volume_id: Option<String>,
+    /// Mount point for the persistent volume inside the sandbox.
+    pub volume_mount_path: Option<String>,
+}
+```
+
+## Methods
+
+<ParamField path="name" type="fn(&self) -> &str" required>
+  Human-readable name for this sandbox type (e.g., "local", "daytona").
+  
+  Used for logging and telemetry.
+</ParamField>
+
+<ParamField path="working_dir" type="fn(&self) -> &str" required>
+  The root working directory inside this sandbox.
+  
+  All relative paths in `exec`, `read_file`, and `write_file` are resolved relative to this directory.
+</ParamField>
+
+<ParamField path="exec" type="async fn(&self, command: &str, args: &[&str]) -> Result<ExecOutput>" required>
+  Execute a command with arguments inside the sandbox.
+  
+  **Parameters:**
+  - `command` - The command to run (e.g., "cargo", "git")
+  - `args` - Array of command arguments
+  
+  **Returns:**
+  - `Ok(ExecOutput)` - Command output with stdout, stderr, and exit code
+  - `Err(_)` - If command execution fails
+  
+  **Example:**
+  ```rust
+  let output = sandbox.exec("cargo", &["test", "--all"]).await?;
+  if output.exit_code != 0 {
+      eprintln!("Tests failed: {}", output.stderr);
+  }
+  ```
+</ParamField>
+
+<ParamField path="exec_shell" type="async fn(&self, shell_cmd: &str) -> Result<ExecOutput>">
+  Execute a shell command string (passed to `sh -c`).
+  
+  **Parameters:**
+  - `shell_cmd` - Shell command string (supports pipes, &&, etc.)
+  
+  **Returns:**
+  - `Ok(ExecOutput)` - Command output
+  - `Err(_)` - If execution fails
+  
+  **Default Implementation:** Calls `self.exec("sh", &["-c", shell_cmd])`
+  
+  **Example:**
+  ```rust
+  let output = sandbox.exec_shell("cargo build && cargo test").await?;
+  ```
+</ParamField>
+
+<ParamField path="read_file" type="async fn(&self, path: &str) -> Result<Vec<u8>>" required>
+  Read a file from the sandbox filesystem.
+  
+  **Parameters:**
+  - `path` - File path (relative to working_dir or absolute)
+  
+  **Returns:**
+  - `Ok(Vec<u8>)` - File contents as bytes
+  - `Err(_)` - If file doesn't exist or read fails
+</ParamField>
+
+<ParamField path="write_file" type="async fn(&self, path: &str, content: &[u8]) -> Result<()>" required>
+  Write a file to the sandbox filesystem.
+  
+  **Parameters:**
+  - `path` - File path (relative to working_dir or absolute)
+  - `content` - File contents as bytes
+  
+  **Returns:**
+  - `Ok(())` - File written successfully
+  - `Err(_)` - If write fails
+  
+  **Note:** Creates parent directories automatically if they don't exist.
+</ParamField>
+
+<ParamField path="destroy" type="async fn(&self) -> Result<()>" required>
+  Destroy the sandbox and clean up resources.
+  
+  **Returns:**
+  - `Ok(())` - Cleanup successful
+  - `Err(_)` - If cleanup fails
+  
+  **Note:** For `LocalSandbox` with temp directories, this deletes the temp dir. For `DaytonaSandbox`, this calls the Daytona API to destroy the remote sandbox.
+</ParamField>
+
+## LocalSandbox Implementation
+
+### Construction
+
+```rust
+use std::path::PathBuf;
+use magpie_core::sandbox::LocalSandbox;
+
+// From existing directory (no cleanup on destroy)
+let sandbox = LocalSandbox::from_path(PathBuf::from("/path/to/repo"));
+
+// From cloned repo (temp dir cleaned up on destroy)
+let sandbox = LocalSandbox::from_clone("api-service", "myorg")?;
+```
+
+### Example
+
+```rust
+use magpie_core::sandbox::{LocalSandbox, Sandbox};
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let sandbox = LocalSandbox::from_path(PathBuf::from("/tmp"));
+    
+    // Execute command
+    let output = sandbox.exec("echo", &["hello"]).await?;
+    assert_eq!(output.exit_code, 0);
+    assert!(output.stdout.contains("hello"));
+    
+    // Write and read file
+    sandbox.write_file("test.txt", b"hello world").await?;
+    let content = sandbox.read_file("test.txt").await?;
+    assert_eq!(content, b"hello world");
+    
+    // Shell command with pipes
+    let output = sandbox.exec_shell("echo hello && echo world").await?;
+    assert!(output.stdout.contains("hello"));
+    assert!(output.stdout.contains("world"));
+    
+    // Cleanup
+    sandbox.destroy().await?;
+    Ok(())
+}
+```
+
+## DaytonaSandbox Implementation
+
+### Construction
+
+```rust
+use magpie_core::sandbox::{DaytonaConfig, DaytonaSandbox};
+use std::collections::HashMap;
+
+let config = DaytonaConfig {
+    api_key: std::env::var("DAYTONA_API_KEY")?,
+    base_url: "https://app.daytona.io/api".to_string(),
+    organization_id: None,
+    sandbox_class: "small".to_string(),
+    snapshot_name: Some("magpie-self".to_string()),
+    env_vars: HashMap::new(),
+    volume_id: None,
+    volume_mount_path: None,
+};
+
+// Create and clone repo
+let sandbox = DaytonaSandbox::create(&config, "myorg/api-service").await?;
+
+// Or create from pre-built snapshot
+let sandbox = DaytonaSandbox::create_from_snapshot(
+    &config,
+    "magpie-self",
+    "/workspace/magpie",
+    env_vars,
+    volumes,
+).await?;
+```
+
+### Example
+
+```rust
+use magpie_core::sandbox::{DaytonaConfig, DaytonaSandbox, Sandbox};
+use std::collections::HashMap;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = DaytonaConfig {
+        api_key: std::env::var("DAYTONA_API_KEY")?,
+        base_url: "https://app.daytona.io/api".to_string(),
+        organization_id: None,
+        sandbox_class: "small".to_string(),
+        snapshot_name: None,
+        env_vars: HashMap::new(),
+        volume_id: None,
+        volume_mount_path: None,
+    };
+    
+    // Create remote sandbox with cloned repo
+    let sandbox = DaytonaSandbox::create(&config, "block/goose").await?;
+    
+    // Execute commands remotely
+    let output = sandbox.exec("cargo", &["test"]).await?;
+    println!("Exit code: {}", output.exit_code);
+    
+    // Read/write files via API
+    sandbox.write_file("config.toml", b"key = 'value'").await?;
+    let content = sandbox.read_file("config.toml").await?;
+    
+    // Destroy remote sandbox
+    sandbox.destroy().await?;
+    Ok(())
+}
+```
+
+## Design Notes
+
+- The trait uses `async_trait` for all I/O operations
+- Requires `Send + Sync` bounds for use across async task boundaries
+- `ExecOutput` combines stdout and stderr into a single stream for remote execution
+- Remote sandboxes (Daytona) execute commands via `sh -c` to support shell operators
+- File paths can be relative (to working_dir) or absolute
+- The `destroy` method is idempotent and safe to call multiple times

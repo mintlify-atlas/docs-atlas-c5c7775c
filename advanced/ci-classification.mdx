@@ -1,0 +1,372 @@
+---
+title: 'CI Classification'
+description: 'Skip CI for docs-only changes to save time and resources'
+---
+
+## Overview
+
+Magpie automatically classifies changed files as **docs-only** or **code** to determine whether to run CI checks (lint + test). This optimization prevents unnecessary test runs when only documentation, images, or config files are modified.
+
+## Classification Rules
+
+### Docs-Only Extensions
+
+Files with these extensions are considered docs-only:
+
+<CodeGroup>
+```rust pipeline.rs:1526
+const DOCS_ONLY_EXTENSIONS: &[&str] = &[
+    ".md", ".txt", ".rst", ".adoc",           // Documentation
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",  // Images
+    ".json",  // Config-only JSON (e.g., .vscode settings)
+    ".yml", ".yaml",  // CI config changes (arguably need CI, but typically safe)
+];
+```
+</CodeGroup>
+
+### Docs-Only Paths
+
+Files with these exact names (case-insensitive) are always considered docs-only:
+
+<CodeGroup>
+```rust pipeline.rs:1533
+const DOCS_ONLY_PATHS: &[&str] = &[
+    "LICENSE",
+    "CHANGELOG",
+    "CHANGES",
+    "AUTHORS",
+    "CONTRIBUTORS",
+];
+```
+</CodeGroup>
+
+### Classification Logic
+
+The `needs_ci()` function checks every changed file:
+
+<CodeGroup>
+```rust pipeline.rs:1539
+pub fn needs_ci(changed_files: &[String]) -> bool {
+    if changed_files.is_empty() {
+        return false; // nothing changed, nothing to test
+    }
+
+    for file in changed_files {
+        let lower = file.to_lowercase();
+        let basename = lower.rsplit('/').next().unwrap_or(&lower);
+
+        // Check well-known docs-only filenames
+        if DOCS_ONLY_PATHS.iter().any(|p| basename.eq_ignore_ascii_case(p)) {
+            continue;
+        }
+
+        // Check extension
+        let is_docs = DOCS_ONLY_EXTENSIONS.iter().any(|ext| lower.ends_with(ext));
+        if !is_docs {
+            return true; // at least one code file → run CI
+        }
+    }
+
+    false // all files are docs-only
+}
+```
+</CodeGroup>
+
+<Note>
+The classification is **conservative**: if **any** file doesn't match the docs-only rules, CI runs. Only when **all** changed files are docs-only is CI skipped.
+</Note>
+
+## Pipeline Integration
+
+### Diff Classification
+
+After the agent completes, the pipeline checks which files changed:
+
+<CodeGroup>
+```rust pipeline.rs:1058
+let changed = git.changed_files().await.unwrap_or_default();
+let run_ci = if changed.is_empty() {
+    info!("no files changed — skipping CI");
+    false
+} else {
+    let needs = needs_ci(&changed);
+    if needs {
+        info!(
+            file_count = changed.len(),
+            "code changes detected → running CI"
+        );
+    } else {
+        info!(
+            file_count = changed.len(),
+            files = ?changed,
+            "docs-only changes → skipping CI"
+        );
+    }
+    needs
+};
+```
+</CodeGroup>
+
+### CI Bypass
+
+When `run_ci` is `false`, the pipeline:
+
+1. Skips lint + test execution
+2. Marks `ci_passed = true` (considered a pass)
+3. Commits and opens a PR without running checks
+
+<CodeGroup>
+```rust pipeline.rs:1156
+if run_ci {
+    // Run lint + test with retry loop...
+} else {
+    // Docs-only: skip CI, mark as passed
+    ci_passed = true;
+    info!("CI skipped — docs-only change");
+}
+```
+</CodeGroup>
+
+## Examples
+
+### Docs-Only Changes (CI Skipped)
+
+<Tabs>
+  <Tab title="README update">
+    Changed files:
+    ```
+    README.md
+    docs/getting-started.md
+    ```
+    
+    **Result:** CI skipped ✅
+    
+    Log output:
+    ```
+    docs-only changes → skipping CI
+    CI skipped — docs-only change
+    ```
+  </Tab>
+  
+  <Tab title="License + images">
+    Changed files:
+    ```
+    LICENSE
+    assets/logo.png
+    assets/screenshot.jpg
+    ```
+    
+    **Result:** CI skipped ✅
+  </Tab>
+  
+  <Tab title="Changelog">
+    Changed files:
+    ```
+    CHANGELOG.md
+    ```
+    
+    **Result:** CI skipped ✅
+  </Tab>
+</Tabs>
+
+### Code Changes (CI Runs)
+
+<Tabs>
+  <Tab title="Mixed changes">
+    Changed files:
+    ```
+    README.md
+    src/main.rs  ← code file
+    ```
+    
+    **Result:** CI runs ❌
+    
+    Reason: At least one code file changed.
+  </Tab>
+  
+  <Tab title="Config files">
+    Changed files:
+    ```
+    Cargo.toml
+    rust-toolchain.toml
+    ```
+    
+    **Result:** CI runs ❌
+    
+    Reason: `.toml` is NOT in `DOCS_ONLY_EXTENSIONS`.
+  </Tab>
+  
+  <Tab title="Test files">
+    Changed files:
+    ```
+    tests/integration_test.rs
+    ```
+    
+    **Result:** CI runs ❌
+    
+    Reason: `.rs` is a code extension.
+  </Tab>
+</Tabs>
+
+## Edge Cases
+
+### YAML/JSON Files
+
+CI config files (`.yml`, `.yaml`, `.json`) are classified as docs-only:
+
+```
+.github/workflows/ci.yml  → docs-only ✅
+package.json              → docs-only ✅
+tsconfig.json             → docs-only ✅
+```
+
+<Warning>
+This is a pragmatic tradeoff. CI config changes **should** be tested, but in practice:
+- Most CI tweaks are low-risk (comment changes, version bumps)
+- Running tests for CI config changes creates chicken-and-egg problems
+- The config itself is tested when the PR CI runs
+
+If you need strict validation, remove `.yml`/`.yaml`/`.json` from `DOCS_ONLY_EXTENSIONS`.
+</Warning>
+
+### No Changes
+
+If the agent makes no file changes (e.g., task was already complete), CI is skipped:
+
+```rust
+if changed.is_empty() {
+    info!("no files changed — skipping CI");
+    false
+}
+```
+
+### Empty Repo
+
+If `git.changed_files()` fails (e.g., repo is not a git repository), `changed` is empty and CI is skipped.
+
+## Time Savings
+
+Typical CI execution times:
+
+<CardGroup cols={3}>
+  <Card title="Rust (cargo test)" icon="rust">
+    **2-5 minutes**
+    
+    Incremental builds + test suite
+  </Card>
+  <Card title="Node.js (npm test)" icon="node-js">
+    **1-3 minutes**
+    
+    Jest/Vitest suite
+  </Card>
+  <Card title="Python (pytest)" icon="python">
+    **30s-2 minutes**
+    
+    Test discovery + execution
+  </Card>
+</CardGroup>
+
+**Docs-only classification saves:**
+- 2-5 minutes per docs-only PR
+- Reduced sandbox usage (Daytona billing)
+- Faster PR turnaround for documentation updates
+
+## PR Labels
+
+The pipeline does **not** currently add a `docs-only` label to PRs when CI is skipped. The PR body includes a "CI: passed" badge regardless:
+
+<CodeGroup>
+```rust pipeline.rs:1494
+let body = format!(
+    "## Summary\n\n{commit_msg}\n\n## Changed files\n\n{}\n\n## Context\n\n> {task}\n\n**CI:** {}",
+    file_list,
+    if ci_passed { "passed" } else { "FAILED" },
+);
+```
+</CodeGroup>
+
+<Tip>
+To distinguish skipped CI from actual test runs, check the pipeline logs:
+
+```bash
+grep -i "CI skipped" ~/.magpie/logs/pipeline.log
+```
+</Tip>
+
+## Customization
+
+### Adding Extensions
+
+To classify additional file types as docs-only, edit `DOCS_ONLY_EXTENSIONS`:
+
+<CodeGroup>
+```rust pipeline.rs:1526
+const DOCS_ONLY_EXTENSIONS: &[&str] = &[
+    ".md", ".txt", ".rst", ".adoc",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".json", ".yml", ".yaml",
+    ".pdf", ".docx",  // Add custom extensions here
+];
+```
+</CodeGroup>
+
+### Removing Extensions
+
+To force CI for YAML/JSON files, remove them from the list:
+
+<CodeGroup>
+```rust pipeline.rs:1526
+const DOCS_ONLY_EXTENSIONS: &[&str] = &[
+    ".md", ".txt", ".rst", ".adoc",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    // Removed: ".json", ".yml", ".yaml"
+];
+```
+</CodeGroup>
+
+### Path-Based Rules
+
+To skip CI for specific directories (e.g., `docs/`), add path prefix checks:
+
+<CodeGroup>
+```rust Custom Rule
+if file.starts_with("docs/") || file.starts_with("examples/") {
+    continue; // skip this file
+}
+```
+</CodeGroup>
+
+## Testing
+
+```bash
+cargo test -p magpie-core -- needs_ci
+```
+
+Add test cases for your custom rules:
+
+<CodeGroup>
+```rust Test Example
+#[test]
+fn test_needs_ci_pdf_is_docs_only() {
+    let files = vec!["guide.pdf".to_string()];
+    assert!(!needs_ci(&files)); // should skip CI
+}
+
+#[test]
+fn test_needs_ci_mixed_with_toml() {
+    let files = vec!["README.md".to_string(), "Cargo.toml".to_string()];
+    assert!(needs_ci(&files)); // .toml is code
+}
+```
+</CodeGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Flow" icon="diagram-project" href="/concepts/pipeline">
+    See where CI classification fits in the pipeline
+  </Card>
+  <Card title="CI Loop" icon="rotate" href="/concepts/pipeline">
+    Understand the retry behavior when CI runs
+  </Card>
+</CardGroup>

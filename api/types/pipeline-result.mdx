@@ -1,0 +1,236 @@
+---
+title: "PipelineResult"
+description: "Outcome of a full Magpie pipeline run"
+---
+
+## Overview
+
+`PipelineResult` is returned by `run_pipeline()` and contains all information about what happened during the run: agent output, PR URL, CI status, and overall outcome.
+
+Defined in `crates/magpie-core/src/pipeline.rs:70-78`.
+
+## Struct Definition
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineResult {
+    pub output: String,
+    pub pr_url: Option<String>,
+    pub plane_issue_id: Option<String>,
+    pub ci_passed: bool,
+    pub rounds_used: u32,
+    pub status: PipelineStatus,
+}
+```
+
+## Fields
+
+<ResponseField name="output" type="String" required>
+  The last output from the pipeline's execution. Typically the final agent response or test/lint output from the last CI round.
+  
+  **Usage:** Display this to the user or log it for debugging.
+</ResponseField>
+
+<ResponseField name="pr_url" type="Option<String>">
+  GitHub pull request URL if one was successfully created.
+  
+  Returns `None` if:
+  - `dry_run` is enabled
+  - No changes were made (empty diff)
+  - Git/PR operations failed
+  
+  **Example:** `"https://github.com/anomalyco/magpie/pull/42"`
+</ResponseField>
+
+<ResponseField name="plane_issue_id" type="Option<String>">
+  Plane.so issue ID if Plane integration is configured and the issue was created.
+  
+  Returns `None` if:
+  - `plane` config is not set
+  - Issue creation failed (logged as warning, not an error)
+  
+  **Example:** `"MAGP-123"`
+</ResponseField>
+
+<ResponseField name="ci_passed" type="bool" required>
+  Whether CI checks (lint + test) passed.
+  
+  **Behavior:**
+  - `true` — Tests and linter both exited with code 0
+  - `false` — At least one CI check failed after all retry rounds
+  - `true` (special case) — No code changes detected, CI skipped (docs-only)
+</ResponseField>
+
+<ResponseField name="rounds_used" type="u32" required>
+  Number of CI rounds executed. For TDD/Diagnostic blueprints, if tests pass inside the blueprint, this is still `1` even though the external CI loop was skipped.
+  
+  **Range:** `1` to `max_ci_rounds` (from config)
+</ResponseField>
+
+<ResponseField name="status" type="PipelineStatus" required>
+  High-level outcome classification. See [PipelineStatus](#pipelinestatus) enum below.
+</ResponseField>
+
+## PipelineStatus
+
+Defined in `crates/magpie-core/src/pipeline.rs:81-87`.
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PipelineStatus {
+    Success,
+    PartialSuccess,
+    AgentFailed,
+    SetupFailed,
+}
+```
+
+### Variants
+
+<ResponseField name="Success" type="enum variant">
+  Pipeline completed successfully:
+  - Agent finished without errors
+  - CI passed (`ci_passed == true`)
+  - PR was created (or would have been in non-dry-run)
+</ResponseField>
+
+<ResponseField name="PartialSuccess" type="enum variant">
+  Agent completed and opened a PR, but CI failed:
+  - Agent made code changes
+  - PR was created (`pr_url.is_some()`)
+  - CI failed after all retry rounds (`ci_passed == false`)
+  
+  **User Action:** Review the PR — tests may be flaky, or the agent's solution may need manual fixes.
+</ResponseField>
+
+<ResponseField name="AgentFailed" type="enum variant">
+  Agent execution failed:
+  - Blueprint runner returned an error (e.g. agent crashed, command failed with `continue_on_error: false`)
+  - No PR was created
+  
+  **User Action:** Check logs. The agent may have hit a tool error, timeout, or invalid state.
+</ResponseField>
+
+<ResponseField name="SetupFailed" type="enum variant">
+  Pre-agent setup failed:
+  - Repo parsing/cloning failed (multi-repo mode)
+  - Org validation failed
+  - Git branch creation failed
+  - Sandbox creation failed (Daytona mode)
+  
+  **User Action:** Fix the setup issue (e.g. invalid repo name, missing credentials, network failure).
+</ResponseField>
+
+## Status Decision Logic
+
+From `crates/magpie-core/src/pipeline.rs:1224-1230`:
+
+```rust
+let status = if ci_passed {
+    PipelineStatus::Success
+} else if pr_url.is_some() {
+    PipelineStatus::PartialSuccess
+} else {
+    PipelineStatus::AgentFailed
+};
+```
+
+**Note:** `SetupFailed` is returned early (before reaching this logic) when pre-flight checks fail.
+
+## Usage Example
+
+### Discord Bot Handler
+
+```rust
+use magpie_core::pipeline::{run_pipeline, PipelineStatus};
+
+let result = run_pipeline(&platform, &channel_id, user, task, &config).await?;
+
+match result.status {
+    PipelineStatus::Success => {
+        let pr = result.pr_url.unwrap();
+        platform.send_message(
+            &channel_id,
+            &format!("✅ Done! PR: {pr}\n\nCI passed ✓")
+        ).await?;
+    }
+    PipelineStatus::PartialSuccess => {
+        let pr = result.pr_url.unwrap();
+        platform.send_message(
+            &channel_id,
+            &format!("⚠️ PR created but CI failed: {pr}\n\nOutput:\n```\n{}\n```", result.output)
+        ).await?;
+    }
+    PipelineStatus::AgentFailed => {
+        platform.send_message(
+            &channel_id,
+            &format!("❌ Agent failed:\n```\n{}\n```", result.output)
+        ).await?;
+    }
+    PipelineStatus::SetupFailed => {
+        platform.send_message(
+            &channel_id,
+            &format!("❌ Setup failed: {}", result.output)
+        ).await?;
+    }
+}
+```
+
+### CLI Reporting
+
+```rust
+let result = run_pipeline(&platform, "cli", "local", &task, &config).await?;
+
+println!("Rounds used: {}", result.rounds_used);
+println!("CI passed: {}", result.ci_passed);
+
+if let Some(url) = result.pr_url {
+    println!("PR: {url}");
+}
+
+if let Some(issue_id) = result.plane_issue_id {
+    println!("Plane issue: {issue_id}");
+}
+
+std::process::exit(match result.status {
+    PipelineStatus::Success => 0,
+    _ => 1,
+});
+```
+
+## Serialization
+
+`PipelineResult` derives `Serialize` and `Deserialize` (serde), so it can be:
+- Logged as JSON for telemetry
+- Returned from HTTP APIs
+- Stored in a database
+
+```rust
+let json = serde_json::to_string(&result)?;
+println!("{json}");
+```
+
+**Example JSON:**
+
+```json
+{
+  "output": "All tests passed",
+  "pr_url": "https://github.com/anomalyco/magpie/pull/42",
+  "plane_issue_id": "MAGP-123",
+  "ci_passed": true,
+  "rounds_used": 1,
+  "status": "Success"
+}
+```
+
+## Notes
+
+- **Partial Success is Not Failure:** `PartialSuccess` means the agent did its job and created a PR. The CI failure might be a flaky test or an edge case the agent didn't handle. Review the PR.
+- **Empty Diffs:** If the agent makes no changes (empty git diff), no commit/PR is created, and `pr_url` is `None`. This is usually `AgentFailed` status.
+- **Docs-Only Changes:** If all changed files are markdown/docs (detected by `needs_ci()`), CI is skipped and `ci_passed` is set to `true` automatically.
+
+## See Also
+
+- [PipelineConfig](/api/types/pipeline-config) — Input configuration for the pipeline
+- [TaskComplexity](/api/types/task-complexity) — Classification that affects which blueprint runs
+- [Blueprint](/api/types/blueprint) — The orchestration structure executed during the pipeline

@@ -1,0 +1,626 @@
+---
+title: 'Docker Setup'
+description: 'Containerize Magpie bots and CLI for consistent deployment across environments'
+icon: 'docker'
+---
+
+Docker provides a consistent runtime environment for Magpie across development, testing, and production. This guide covers building and running Magpie containers.
+
+## Prerequisites
+
+- **Docker** 20.10+ installed ([Get Docker](https://docs.docker.com/get-docker/))
+- **Docker Buildx** for multi-platform builds (included in Docker Desktop)
+- Basic familiarity with Docker and containers
+
+## Building Docker Images
+
+### Multi-Stage Rust Build
+
+Create a `Dockerfile` in the workspace root for building production images:
+
+```dockerfile
+# Build stage
+FROM rust:1.75-slim as builder
+
+WORKDIR /build
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build the desired crate (pass as --build-arg CRATE=magpie-discord)
+ARG CRATE=magpie-discord
+RUN cargo build --release -p ${CRATE}
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude CLI (version 0.3.0)
+RUN curl -fsSL https://github.com/anthropics/claude-cli/releases/download/v0.3.0/claude-linux-amd64 \
+    -o /usr/local/bin/claude \
+    && chmod +x /usr/local/bin/claude
+
+WORKDIR /app
+
+# Copy binary from builder
+ARG CRATE=magpie-discord
+COPY --from=builder /build/target/release/${CRATE} /app/magpie
+
+# Create non-root user
+RUN useradd -m -u 1000 magpie && chown -R magpie:magpie /app
+USER magpie
+
+ENTRYPOINT ["/app/magpie"]
+```
+
+### Build Commands
+
+<Steps>
+  <Step title="Build Discord Bot Image">
+    ```bash
+    docker build \
+      --build-arg CRATE=magpie-discord \
+      -t magpie-discord:latest \
+      -f Dockerfile .
+    ```
+  </Step>
+
+  <Step title="Build Teams Bot Image">
+    ```bash
+    docker build \
+      --build-arg CRATE=magpie-teams \
+      -t magpie-teams:latest \
+      -f Dockerfile .
+    ```
+  </Step>
+
+  <Step title="Build CLI Image">
+    ```bash
+    docker build \
+      --build-arg CRATE=magpie-cli \
+      -t magpie-cli:latest \
+      -f Dockerfile .
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Build time: 10-15 minutes for first build, ~2 minutes for subsequent builds with layer caching.
+</Note>
+
+### Multi-Platform Builds
+
+For deployment to ARM-based systems (Apple Silicon, AWS Graviton):
+
+```bash
+docker buildx create --use
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --build-arg CRATE=magpie-discord \
+  -t yourregistry/magpie-discord:latest \
+  --push \
+  .
+```
+
+## Running Containers
+
+### Discord Bot
+
+<Steps>
+  <Step title="Create Environment File">
+    Create `discord.env`:
+    
+    ```bash
+    DISCORD_TOKEN=your-discord-bot-token
+    MAGPIE_REPO_DIR=/workspace/repo
+    MAGPIE_BASE_BRANCH=main
+    MAGPIE_TEST_CMD=cargo test
+    MAGPIE_LINT_CMD=cargo clippy
+    MAGPIE_MAX_CI_ROUNDS=2
+    MAGPIE_GITHUB_ORG=your-org
+    ```
+  </Step>
+
+  <Step title="Run Container">
+    ```bash
+    docker run -d \
+      --name magpie-discord \
+      --env-file discord.env \
+      -v $(pwd)/workspace:/workspace \
+      --restart unless-stopped \
+      magpie-discord:latest
+    ```
+    
+    The `-v` flag mounts a local workspace directory for the bot to operate on repositories.
+  </Step>
+
+  <Step title="View Logs">
+    ```bash
+    docker logs -f magpie-discord
+    ```
+  </Step>
+</Steps>
+
+### Teams Bot
+
+<Steps>
+  <Step title="Create Environment File">
+    Create `teams.env`:
+    
+    ```bash
+    TEAMS_APP_ID=your-app-id
+    TEAMS_APP_SECRET=your-app-secret
+    TEAMS_LISTEN_ADDR=0.0.0.0:3978
+    MAGPIE_REPO_DIR=/workspace/repo
+    MAGPIE_BASE_BRANCH=main
+    MAGPIE_TEST_CMD=cargo test
+    MAGPIE_LINT_CMD=cargo clippy
+    ```
+  </Step>
+
+  <Step title="Run Container">
+    ```bash
+    docker run -d \
+      --name magpie-teams \
+      --env-file teams.env \
+      -v $(pwd)/workspace:/workspace \
+      -p 3978:3978 \
+      --restart unless-stopped \
+      magpie-teams:latest
+    ```
+    
+    The `-p` flag exposes the webhook server on port 3978.
+  </Step>
+
+  <Step title="Verify Health">
+    ```bash
+    curl http://localhost:3978/health
+    # Should return: ok
+    ```
+  </Step>
+</Steps>
+
+### CLI (One-off Tasks)
+
+```bash
+# Run single prompt
+docker run --rm \
+  -v $(pwd):/workspace \
+  -e MAGPIE_REPO_DIR=/workspace \
+  magpie-cli:latest \
+  "add a health check endpoint"
+
+# Run full pipeline
+docker run --rm \
+  -v $(pwd):/workspace \
+  -e MAGPIE_REPO_DIR=/workspace \
+  magpie-cli:latest \
+  --pipeline "fix the login bug"
+```
+
+## Docker Compose
+
+For orchestrating multiple services, use Docker Compose:
+
+### `docker-compose.yml`
+
+```yaml
+version: '3.8'
+
+services:
+  magpie-discord:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CRATE: magpie-discord
+    container_name: magpie-discord
+    env_file:
+      - discord.env
+    volumes:
+      - ./workspace:/workspace
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  magpie-teams:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CRATE: magpie-teams
+    container_name: magpie-teams
+    env_file:
+      - teams.env
+    volumes:
+      - ./workspace:/workspace
+    ports:
+      - "3978:3978"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    image: nginx:alpine
+    container_name: magpie-nginx
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/ssl:ro
+    depends_on:
+      - magpie-teams
+    restart: unless-stopped
+```
+
+### Run with Compose
+
+```bash
+# Start all services
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop all services
+docker compose down
+
+# Rebuild and restart
+docker compose up -d --build
+```
+
+## Daytona Devbox Image
+
+The repository includes a specialized Dockerfile for creating Daytona sandbox images with Magpie pre-installed:
+
+### `Dockerfile.devbox`
+
+This image is based on `daytonaio/sandbox:latest` and includes:
+
+- **Rust toolchain** (stable, installed globally)
+- **GitHub CLI** (`gh`)
+- **Pre-fetched cargo dependencies** (from cloned repo)
+- **Daytona toolbox agent** (inherited from base image)
+
+### Building the Devbox Image
+
+```bash
+# Build for Daytona Cloud (must be linux/amd64)
+docker buildx build \
+  --platform linux/amd64 \
+  -f Dockerfile.devbox \
+  -t yourregistry/magpie-devbox:v1 \
+  --push \
+  .
+```
+
+<Warning>
+  Daytona Cloud requires `linux/amd64` platform. Do not use ARM builds.
+</Warning>
+
+### Using with Daytona
+
+1. Push the image to a registry accessible by Daytona Cloud
+2. Create a Daytona snapshot referencing the image:
+   ```bash
+   daytona snapshot create \
+     --name magpie-devbox \
+     --image yourregistry/magpie-devbox:v1
+   ```
+3. Configure Magpie to use the snapshot:
+   ```bash
+   DAYTONA_SNAPSHOT_NAME=magpie-devbox
+   ```
+
+### What's Pre-Cached
+
+The devbox image pre-fetches dependencies to speed up pipeline execution:
+
+- Clones Magpie repo to `/workspace/magpie` (see `Dockerfile.devbox:41`)
+- Runs `cargo fetch` to download all crate dependencies
+- Configures permissions for `daytona` user (uid 1000)
+
+## Container Configuration
+
+### Volume Mounts
+
+| Mount | Purpose | Required |
+|-------|---------|----------|
+| `/workspace` | Repository working directory | Yes |
+| `/app/.env` | Environment variables file | No (use `--env-file`) |
+| `/app/.magpie/traces` | Pipeline trace logs | No (for debugging) |
+
+### Environment Variables
+
+All environment variables from [Deploying Discord Bot](/guides/deploying-discord-bot#environment-configuration) and [Deploying Teams Bot](/guides/deploying-teams-bot#environment-configuration) are supported in containers.
+
+### Resource Limits
+
+Recommended resource limits:
+
+```bash
+docker run -d \
+  --name magpie-discord \
+  --memory="2g" \
+  --cpus="1.5" \
+  --env-file discord.env \
+  magpie-discord:latest
+```
+
+Or in Docker Compose:
+
+```yaml
+services:
+  magpie-discord:
+    # ...
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+```
+
+### Health Checks
+
+For the Teams webhook server:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:3978/health || exit 1
+```
+
+Or in Docker Compose:
+
+```yaml
+services:
+  magpie-teams:
+    # ...
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3978/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+```
+
+## Kubernetes Deployment
+
+### Deployment YAML
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: magpie-teams
+  namespace: magpie
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: magpie-teams
+  template:
+    metadata:
+      labels:
+        app: magpie-teams
+    spec:
+      containers:
+      - name: magpie-teams
+        image: yourregistry/magpie-teams:latest
+        ports:
+        - containerPort: 3978
+        env:
+        - name: TEAMS_APP_ID
+          valueFrom:
+            secretKeyRef:
+              name: magpie-secrets
+              key: teams-app-id
+        - name: TEAMS_APP_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: magpie-secrets
+              key: teams-app-secret
+        - name: MAGPIE_REPO_DIR
+          value: "/workspace/repo"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3978
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3978
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: magpie-workspace-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: magpie-teams
+  namespace: magpie
+spec:
+  selector:
+    app: magpie-teams
+  ports:
+  - protocol: TCP
+    port: 3978
+    targetPort: 3978
+  type: LoadBalancer
+```
+
+### Create Secrets
+
+```bash
+kubectl create namespace magpie
+
+kubectl create secret generic magpie-secrets \
+  --from-literal=teams-app-id=your-app-id \
+  --from-literal=teams-app-secret=your-app-secret \
+  --namespace magpie
+```
+
+### Deploy
+
+```bash
+kubectl apply -f magpie-deployment.yaml
+kubectl get pods -n magpie
+kubectl logs -f -n magpie deployment/magpie-teams
+```
+
+## Troubleshooting
+
+### Container fails to start
+
+<AccordionGroup>
+  <Accordion title="Check environment variables">
+    Ensure all required variables are set:
+    ```bash
+    docker inspect magpie-discord | grep -A 20 Env
+    ```
+  </Accordion>
+  
+  <Accordion title="Verify volume mounts">
+    Check that mounted directories exist and have correct permissions:
+    ```bash
+    docker inspect magpie-discord | grep -A 10 Mounts
+    ```
+  </Accordion>
+  
+  <Accordion title="Check logs for errors">
+    ```bash
+    docker logs magpie-discord
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Permission denied errors
+
+<AccordionGroup>
+  <Accordion title="Fix volume permissions">
+    The container runs as uid 1000 (`magpie` user). Ensure mounted volumes are writable:
+    ```bash
+    chown -R 1000:1000 ./workspace
+    ```
+  </Accordion>
+  
+  <Accordion title="Run as root (not recommended)">
+    Override the user (only for debugging):
+    ```bash
+    docker run --user root ...
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Network connectivity issues
+
+<AccordionGroup>
+  <Accordion title="Check port bindings">
+    Verify port 3978 is exposed for Teams bot:
+    ```bash
+    docker port magpie-teams
+    # Should show: 3978/tcp -> 0.0.0.0:3978
+    ```
+  </Accordion>
+  
+  <Accordion title="Test from inside container">
+    ```bash
+    docker exec -it magpie-teams curl http://localhost:3978/health
+    ```
+  </Accordion>
+  
+  <Accordion title="Check firewall rules">
+    Ensure port 3978 is allowed in your firewall/security group.
+  </Accordion>
+</AccordionGroup>
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Use Multi-Stage Builds" icon="layer-group">
+    Keep final images small by using multi-stage builds. The example Dockerfile reduces image size from ~2GB to ~500MB.
+  </Card>
+  
+  <Card title="Pin Versions" icon="thumbtack">
+    Use specific image tags (e.g., `rust:1.75-slim`) instead of `latest` for reproducible builds.
+  </Card>
+  
+  <Card title="Non-Root User" icon="user-shield">
+    Always run containers as non-root users (uid 1000 in examples) for security.
+  </Card>
+  
+  <Card title="Health Checks" icon="heart-pulse">
+    Implement health checks for orchestrators to detect and restart failed containers.
+  </Card>
+  
+  <Card title="Resource Limits" icon="gauge-high">
+    Set CPU and memory limits to prevent resource exhaustion.
+  </Card>
+  
+  <Card title="Logging" icon="file-lines">
+    Configure log rotation to prevent disk space issues (`max-size`, `max-file`).
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Discord Bot" icon="discord" href="/guides/deploying-discord-bot">
+    Deploy the Discord adapter
+  </Card>
+  <Card title="Teams Bot" icon="microsoft" href="/guides/deploying-teams-bot">
+    Deploy the Teams webhook adapter
+  </Card>
+  <Card title="Kubernetes" icon="cubes" href="/guides/kubernetes-deployment">
+    Advanced Kubernetes deployment patterns
+  </Card>
+  <Card title="CI/CD" icon="code-branch" href="/guides/ci-cd-integration">
+    Automate builds with GitHub Actions
+  </Card>
+</CardGroup>

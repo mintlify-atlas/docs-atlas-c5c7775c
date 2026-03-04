@@ -1,0 +1,505 @@
+---
+title: Discord Adapter
+description: Deploy Magpie as a Discord bot with thread-based task management
+icon: discord
+---
+
+The Discord adapter enables Magpie to run as a Discord bot, listening for @mentions in your server channels. Each task spawns a dedicated thread for pipeline execution and status updates.
+
+## Architecture
+
+The Discord adapter (`magpie-discord`) is built with [Serenity](https://github.com/serenity-rs/serenity), a Rust library for the Discord API. When a user @mentions the bot, it:
+
+<Steps>
+  <Step title="Creates a thread from the triggering message">
+    Thread names are formatted as `magpie: <task>` and auto-truncate at 100 characters (Discord's limit) while respecting word boundaries.
+  </Step>
+  
+  <Step title="Sends an acknowledgment">
+    Posts "⏳ **Got it** — working on this now…" to the thread immediately.
+  </Step>
+  
+  <Step title="Runs the pipeline in the background">
+    Executes the full autonomous coding workflow (branch creation, agent work, CI, PR).
+  </Step>
+  
+  <Step title="Archives and locks the thread">
+    After posting the final result, the thread is automatically archived and locked to prevent further interaction.
+  </Step>
+</Steps>
+
+## Setup
+
+### 1. Create a Discord Bot
+
+<Steps>
+  <Step title="Navigate to the Discord Developer Portal">
+    Go to [discord.com/developers/applications](https://discord.com/developers/applications) and create a new application.
+  </Step>
+  
+  <Step title="Enable the Bot">
+    Under the **Bot** tab, click **Add Bot** and confirm.
+  </Step>
+  
+  <Step title="Configure Gateway Intents">
+    Enable these privileged intents:
+    - `GUILD_MESSAGES` — receive message events in servers
+    - `MESSAGE_CONTENT` — read message content for task parsing
+    - `GUILDS` — access server metadata
+  </Step>
+  
+  <Step title="Copy the Bot Token">
+    Click **Reset Token** and copy the generated token. Store it securely — you'll need it for `DISCORD_TOKEN`.
+  </Step>
+</Steps>
+
+### 2. Invite the Bot to Your Server
+
+Generate an OAuth2 invite URL with these scopes and permissions:
+
+- **Scopes**: `bot`
+- **Permissions**:
+  - Read Messages/View Channels
+  - Send Messages
+  - Send Messages in Threads
+  - Create Public Threads
+  - Manage Threads
+
+Invite URL format:
+```
+https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=395410972752&scope=bot
+```
+
+### 3. Configure Environment Variables
+
+Create a `.env` file or set environment variables:
+
+```bash .env
+# Required: Discord bot token from the Developer Portal
+DISCORD_TOKEN=your_discord_bot_token_here
+
+# Repository configuration
+MAGPIE_REPO_DIR=/path/to/your/repo
+MAGPIE_BASE_BRANCH=main
+MAGPIE_GITHUB_ORG=your-org  # Optional: for org-scoped repo cloning
+
+# CI commands
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy"
+MAGPIE_MAX_CI_ROUNDS=2
+
+# Optional: Plane.so issue tracking
+PLANE_BASE_URL=https://your-plane.so
+PLANE_API_KEY=your_plane_api_key
+PLANE_WORKSPACE_SLUG=your-workspace
+PLANE_PROJECT_ID=your-project-id
+
+# Optional: Daytona sandbox execution
+DAYTONA_API_KEY=your_daytona_key
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_ORGANIZATION_ID=your-org-id
+DAYTONA_SANDBOX_CLASS=small
+```
+
+See the [environment reference](/configuration/environment-variables) for complete variable documentation.
+
+### 4. Run the Bot
+
+<CodeGroup>
+```bash Local Development
+cargo run -p magpie-discord
+```
+
+```bash Production (compiled binary)
+./target/release/magpie-discord
+```
+
+```dockerfile Docker
+FROM rust:1.75 as builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p magpie-discord
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates git
+COPY --from=builder /build/target/release/magpie-discord /usr/local/bin/
+CMD ["magpie-discord"]
+```
+</CodeGroup>
+
+## Usage
+
+Mention the bot in any channel with a task description:
+
+<CodeGroup>
+```text Simple Task
+@Magpie add a health check endpoint to the API
+```
+
+```text Bug Fix
+@Magpie fix the race condition in user authentication
+```
+
+```text Refactoring
+@Magpie refactor the database connection pool to use deadpool instead of r2d2
+```
+</CodeGroup>
+
+The bot will:
+1. Create a thread named `magpie: add a health check endpoint to the API`
+2. Acknowledge the task in the thread
+3. Run the pipeline (you'll see progress in logs)
+4. Post the final result with PR link
+5. Archive and lock the thread
+
+## Thread Behavior
+
+### Auto-Archiving
+
+Magpie automatically archives and locks threads after posting the final pipeline result. This is implemented via the `close_thread()` method in `ChatPlatform`:
+
+```rust crates/magpie-discord/src/adapter.rs:46-56
+async fn close_thread(&self, channel_id: &str) -> Result<()> {
+    let id: u64 = channel_id.parse().context("invalid discord channel ID")?;
+    let channel = ChannelId::new(id);
+
+    channel
+        .edit_thread(&self.http, EditThread::new().archived(true).locked(true))
+        .await
+        .context("failed to archive discord thread")?;
+
+    Ok(())
+}
+```
+
+### Thread Name Truncation
+
+Discord limits thread names to 100 characters. Magpie intelligently truncates long task descriptions:
+
+- Preserves the `magpie:` prefix
+- Breaks at word boundaries (not mid-word)
+- Appends `...` when truncated
+- Handles Unicode/emoji correctly
+
+<CodeGroup>
+```text Short Task (no truncation)
+magpie: fix login bug
+```
+
+```text Long Task (truncated at word boundary)
+magpie: refactor the entire authentication module to use OAuth2 with PKCE flow and update...
+```
+</CodeGroup>
+
+### Fallback to Channel
+
+If thread creation fails (e.g., missing permissions), Magpie falls back to posting directly in the channel:
+
+```rust crates/magpie-discord/src/handler.rs:52-71
+let reply_channel = match msg
+    .channel_id
+    .create_thread_from_message(
+        &ctx.http,
+        msg.id,
+        CreateThread::new(&thread_name)
+            .auto_archive_duration(AutoArchiveDuration::OneDay)
+            .kind(ChannelType::PublicThread),
+    )
+    .await
+{
+    Ok(thread) => {
+        info!(thread_id = %thread.id, "created thread: {thread_name}");
+        thread.id
+    }
+    Err(e) => {
+        warn!("failed to create thread, falling back to channel: {e}");
+        msg.channel_id
+    }
+};
+```
+
+## Mention Handling
+
+Magpie strips Discord @mention syntax from task text:
+
+```rust crates/magpie-discord/src/handler.rs:165-173
+pub fn strip_mention(content: &str, bot_id: u64) -> String {
+    let mention_patterns = [format!("<@{bot_id}>"), format!("<@!{bot_id}>")];
+
+    let mut result = content.to_string();
+    for pattern in &mention_patterns {
+        result = result.replace(pattern, "");
+    }
+    result.trim().to_string()
+}
+```
+
+Both `<@123456>` (standard) and `<@!123456>` (nickname) mentions are supported.
+
+## Deployment Patterns
+
+### Systemd Service
+
+```ini /etc/systemd/system/magpie-discord.service
+[Unit]
+Description=Magpie Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=magpie
+WorkingDirectory=/opt/magpie
+EnvironmentFile=/opt/magpie/.env
+ExecStart=/opt/magpie/magpie-discord
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable magpie-discord
+sudo systemctl start magpie-discord
+sudo systemctl status magpie-discord
+```
+
+### Docker Compose
+
+```yaml docker-compose.yml
+version: '3.8'
+
+services:
+  magpie-discord:
+    build:
+      context: .
+      dockerfile: Dockerfile.discord
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - MAGPIE_REPO_DIR=/workspace
+      - MAGPIE_BASE_BRANCH=main
+      - MAGPIE_GITHUB_ORG=${GITHUB_ORG}
+      - RUST_LOG=info
+    volumes:
+      - ./workspace:/workspace
+      - ~/.gitconfig:/root/.gitconfig:ro
+      - ~/.ssh:/root/.ssh:ro
+    restart: unless-stopped
+```
+
+### Kubernetes Deployment
+
+```yaml magpie-discord.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: magpie-discord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: magpie-discord
+  template:
+    metadata:
+      labels:
+        app: magpie-discord
+    spec:
+      containers:
+      - name: magpie
+        image: your-registry/magpie-discord:latest
+        envFrom:
+        - secretRef:
+            name: magpie-discord-secrets
+        - configMapRef:
+            name: magpie-config
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: ssh-keys
+          mountPath: /root/.ssh
+          readOnly: true
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: magpie-workspace
+      - name: ssh-keys
+        secret:
+          secretName: git-ssh-keys
+          defaultMode: 0600
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: magpie-discord-secrets
+type: Opaque
+stringData:
+  DISCORD_TOKEN: "your_token_here"
+  DAYTONA_API_KEY: "your_daytona_key"
+```
+
+## Monitoring & Debugging
+
+### Logging
+
+Magpie uses `tracing` for structured logging. Control verbosity with `RUST_LOG`:
+
+<CodeGroup>
+```bash Info (default)
+RUST_LOG=info cargo run -p magpie-discord
+```
+
+```bash Debug (verbose)
+RUST_LOG=debug cargo run -p magpie-discord
+```
+
+```bash Module-specific
+RUST_LOG=magpie_core=debug,magpie_discord=trace cargo run -p magpie-discord
+```
+</CodeGroup>
+
+Key log messages:
+```
+info  magpie-discord connected as MagpieBot#1234
+info  created thread: magpie: fix login bug
+info  pipeline started for task: fix login bug
+info  pipeline complete status=Success pr=Some("https://github.com/org/repo/pull/42")
+info  thread 123456789 archived and locked
+```
+
+### Health Checks
+
+The Discord adapter doesn't expose an HTTP health endpoint. Monitor bot status via:
+
+1. **Discord presence**: Online/offline status in server member list
+2. **Logs**: `magpie-discord connected as ...` on startup
+3. **Test mention**: Send a simple task and verify acknowledgment
+
+### Common Issues
+
+<AccordionGroup>
+  <Accordion title="Bot doesn't respond to mentions">
+    **Check permissions**:
+    - Verify `MESSAGE_CONTENT` intent is enabled in Developer Portal
+    - Confirm bot has "View Channel" and "Send Messages" permissions
+    
+    **Check logs**:
+    ```bash
+    RUST_LOG=debug cargo run -p magpie-discord
+    ```
+    
+    Look for "Ignoring bot message" or "No mention detected" warnings.
+  </Accordion>
+  
+  <Accordion title="Thread creation fails">
+    **Missing permissions**: Bot needs "Create Public Threads" and "Manage Threads"
+    
+    **Fallback behavior**: Magpie will post to the original channel if thread creation fails. Check logs for:
+    ```
+    warn  failed to create thread, falling back to channel: Missing Permissions
+    ```
+  </Accordion>
+  
+  <Accordion title="Pipeline errors not reported to Discord">
+    **Check send_message fallback**: If the platform send fails, Magpie attempts a direct channel send:
+    
+    ```rust crates/magpie-discord/src/handler.rs:101-110
+    if let Err(e) = platform.send_message(&channel_id, &reply).await {
+        error!("failed to send result via platform: {e}");
+        // Fallback: try direct channel send
+        if let Err(send_err) =
+            serenity::all::ChannelId::new(channel_id.parse().unwrap_or(0))
+                .say(&http, &reply)
+                .await
+        {
+            error!("fallback send also failed: {send_err}");
+        }
+    }
+    ```
+    
+    Check logs for "failed to send result via platform" or "fallback send also failed".
+  </Accordion>
+  
+  <Accordion title="Bot crashes on startup">
+    **Invalid token**: Verify `DISCORD_TOKEN` is correct
+    ```
+    Error: DISCORD_TOKEN env var not set
+    ```
+    
+    **Network issues**: Check firewall/proxy settings for Discord Gateway access (wss://gateway.discord.gg)
+    
+    **Serenity version conflicts**: Rebuild with clean dependencies:
+    ```bash
+    cargo clean && cargo build -p magpie-discord
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Implementation Reference
+
+The Discord adapter implements the `ChatPlatform` trait from `magpie-core`:
+
+```rust crates/magpie-discord/src/adapter.rs:22-57
+#[async_trait]
+impl ChatPlatform for DiscordPlatform {
+    fn name(&self) -> &str {
+        "discord"
+    }
+
+    async fn fetch_history(&self, _channel_id: &str) -> Result<String> {
+        // The trigger message itself is already passed as `task` in run_pipeline;
+        // dumping the last N channel messages added noise rather than useful context.
+        Ok(String::new())
+    }
+
+    async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
+        let id: u64 = channel_id.parse().context("invalid discord channel ID")?;
+        let channel = ChannelId::new(id);
+
+        channel
+            .say(&self.http, text)
+            .await
+            .context("failed to send discord message")?;
+
+        Ok(())
+    }
+
+    async fn close_thread(&self, channel_id: &str) -> Result<()> {
+        let id: u64 = channel_id.parse().context("invalid discord channel ID")?;
+        let channel = ChannelId::new(id);
+
+        channel
+            .edit_thread(&self.http, EditThread::new().archived(true).locked(true))
+            .await
+            .context("failed to archive discord thread")?;
+
+        Ok()
+    }
+}
+```
+
+### Source Files
+
+- `crates/magpie-discord/src/main.rs` — Entry point, client setup
+- `crates/magpie-discord/src/adapter.rs` — `ChatPlatform` implementation
+- `crates/magpie-discord/src/handler.rs` — Serenity event handler, thread management
+- `crates/magpie-discord/src/reply.rs` — Pipeline result formatting
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Teams Adapter" icon="microsoft" href="/adapters/teams">
+    Deploy Magpie to Microsoft Teams with Bot Framework
+  </Card>
+  
+  <Card title="CLI Adapter" icon="terminal" href="/adapters/cli">
+    Run Magpie locally from the command line
+  </Card>
+  
+  <Card title="Custom Adapter" icon="code" href="/adapters/custom">
+    Build your own adapter for Slack, Telegram, or any platform
+  </Card>
+  
+  <Card title="Environment Variables" icon="gear" href="/configuration/environment">
+    Complete reference for all configuration options
+  </Card>
+</CardGroup>

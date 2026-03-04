@@ -1,0 +1,300 @@
+---
+title: 'Deploying the Discord Bot'
+description: 'Deploy Magpie as a Discord bot to trigger automated coding pipelines from Discord threads'
+icon: 'discord'
+---
+
+The Discord bot adapter allows you to trigger Magpie pipelines by mentioning the bot in a Discord server. The bot creates threads per task and archives them on completion.
+
+## Prerequisites
+
+Before deploying the Discord bot, ensure you have:
+
+- **Rust 1.75+** installed via [rustup](https://rustup.rs/)
+- **Claude CLI** configured (required for both Tier 1 and Tier 2 LLM operations)
+- **GitHub CLI** (`gh`) authenticated for creating PRs
+- A **Discord application** with a bot token
+- **Git** for cloning repositories
+
+## Creating a Discord Bot Application
+
+<Steps>
+  <Step title="Create Discord Application">
+    1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
+    2. Click **New Application** and give it a name (e.g., "Magpie")
+    3. Navigate to the **Bot** section in the left sidebar
+    4. Click **Add Bot** to convert your application to a bot
+  </Step>
+
+  <Step title="Configure Bot Permissions">
+    Under the **Bot** section:
+    - Enable **MESSAGE CONTENT INTENT** (required to read message text)
+    - Enable **SERVER MEMBERS INTENT** (optional, for user context)
+    
+    Under **OAuth2 → URL Generator**:
+    - Select scopes: `bot`
+    - Select bot permissions:
+      - `Read Messages/View Channels`
+      - `Send Messages`
+      - `Send Messages in Threads`
+      - `Create Public Threads`
+      - `Manage Threads`
+  </Step>
+
+  <Step title="Get Bot Token">
+    1. In the **Bot** section, click **Reset Token**
+    2. Copy the token (you'll need this for `DISCORD_TOKEN`)
+    3. Keep this token secret — treat it like a password
+  </Step>
+
+  <Step title="Invite Bot to Server">
+    1. Use the OAuth2 URL from step 2 to invite the bot to your Discord server
+    2. Select the server and authorize the requested permissions
+  </Step>
+</Steps>
+
+## Environment Configuration
+
+The Discord bot requires several environment variables. Create a `.env` file or set them in your deployment environment:
+
+### Required Variables
+
+```bash
+# Discord Bot Token (from Discord Developer Portal)
+DISCORD_TOKEN=your-discord-bot-token-here
+```
+
+### Pipeline Configuration
+
+```bash
+# Repository settings
+MAGPIE_REPO_DIR=.                    # Path to git repo (default: current directory)
+MAGPIE_BASE_BRANCH=main              # Base branch for PRs (default: main)
+
+# CI Commands
+MAGPIE_TEST_CMD="cargo test"         # Test command for CI loop
+MAGPIE_LINT_CMD="cargo clippy"       # Lint command for CI loop
+MAGPIE_MAX_CI_ROUNDS=2               # Max CI retry rounds (default: 2)
+
+# GitHub Organization (optional — enables multi-repo support)
+MAGPIE_GITHUB_ORG=your-org-name      # Restrict to specific GitHub org
+```
+
+### Optional: Plane Issue Tracking
+
+```bash
+# Self-hosted Plane integration for automatic issue creation
+PLANE_BASE_URL=https://plane.yourcompany.com
+PLANE_API_KEY=your-plane-api-key
+PLANE_WORKSPACE_SLUG=your-workspace
+PLANE_PROJECT_ID=project-uuid
+```
+
+### Optional: Daytona Sandbox
+
+```bash
+# Use remote Daytona sandboxes instead of local execution
+DAYTONA_API_KEY=your-daytona-api-key
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_ORGANIZATION_ID=your-org-id
+DAYTONA_SANDBOX_CLASS=small          # small | medium | large
+DAYTONA_SNAPSHOT_NAME=magpie-devbox  # Pre-configured snapshot
+DAYTONA_ENV="KEY1=val1,KEY2=val2"    # Additional env vars for sandbox
+```
+
+## Building and Running
+
+<Steps>
+  <Step title="Build the Discord Bot">
+    Build the `magpie-discord` binary from the workspace root:
+    
+    ```bash
+    cargo build --release -p magpie-discord
+    ```
+    
+    The compiled binary will be at `target/release/magpie-discord`.
+    
+    <Note>
+      First build takes 4-5 minutes due to transitive dependencies (Goose, candle, tree-sitter, etc.).
+    </Note>
+  </Step>
+
+  <Step title="Run the Bot Locally">
+    Set your environment variables and run:
+    
+    ```bash
+    # Load .env file
+    export $(cat .env | xargs)
+    
+    # Run the bot
+    cargo run --release -p magpie-discord
+    ```
+    
+    Or run the compiled binary directly:
+    
+    ```bash
+    DISCORD_TOKEN=your-token ./target/release/magpie-discord
+    ```
+    
+    You should see:
+    ```
+    INFO starting magpie-discord bot...
+    ```
+  </Step>
+
+  <Step title="Test the Bot">
+    In your Discord server:
+    
+    1. Mention the bot in any channel: `@Magpie add a health check endpoint`
+    2. The bot will create a thread and reply with "Working on it..."
+    3. After the pipeline completes, you'll receive a status message with:
+       - Pipeline status (Success/PartialSuccess/Failed)
+       - PR URL (if created)
+       - Plane issue ID (if configured)
+       - CI status
+    4. The thread will be automatically archived and locked
+  </Step>
+</Steps>
+
+## Production Deployment
+
+### Running as a Systemd Service
+
+Create a systemd service file at `/etc/systemd/system/magpie-discord.service`:
+
+```ini
+[Unit]
+Description=Magpie Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=magpie
+WorkingDirectory=/opt/magpie
+EnvironmentFile=/opt/magpie/.env
+ExecStart=/opt/magpie/magpie-discord
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable magpie-discord
+sudo systemctl start magpie-discord
+sudo systemctl status magpie-discord
+```
+
+### Docker Deployment
+
+See the [Docker Setup Guide](/guides/docker-setup) for containerized deployment options.
+
+### Process Management with PM2
+
+Alternatively, use PM2 for process management:
+
+```bash
+pm2 start magpie-discord --name magpie-discord
+pm2 save
+pm2 startup
+```
+
+## Architecture
+
+The Discord bot implements the `ChatPlatform` trait from `magpie-core`:
+
+- **Event Handler**: Listens for messages mentioning the bot using Serenity (Discord library)
+- **Thread Creation**: Creates a new thread for each task to keep context isolated
+- **Pipeline Trigger**: Calls `run_pipeline()` with the Discord platform adapter
+- **Thread Archival**: Archives and locks threads after pipeline completion
+
+### Key Files
+
+| File | Purpose |
+|------|----------|
+| `crates/magpie-discord/src/main.rs:26` | Reads `DISCORD_TOKEN` and builds `PipelineConfig` |
+| `crates/magpie-discord/src/handler.rs` | Serenity event handler for message events |
+| `crates/magpie-discord/src/adapter.rs` | `ChatPlatform` implementation for Discord |
+| `crates/magpie-discord/src/reply.rs` | Formats pipeline results for Discord |
+
+### Gateway Intents
+
+The bot requires these Discord Gateway intents (configured in code at `main.rs:30`):
+
+```rust
+GatewayIntents::GUILD_MESSAGES | 
+GatewayIntents::MESSAGE_CONTENT | 
+GatewayIntents::GUILDS
+```
+
+## Troubleshooting
+
+### Bot doesn't respond to mentions
+
+<AccordionGroup>
+  <Accordion title="Check MESSAGE_CONTENT intent">
+    Ensure **MESSAGE CONTENT INTENT** is enabled in Discord Developer Portal under Bot settings.
+  </Accordion>
+  
+  <Accordion title="Verify bot permissions">
+    The bot needs:
+    - Read Messages/View Channels
+    - Send Messages
+    - Send Messages in Threads
+    - Create Public Threads
+    - Manage Threads
+  </Accordion>
+  
+  <Accordion title="Check logs">
+    Run with verbose logging:
+    ```bash
+    RUST_LOG=info cargo run -p magpie-discord
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Pipeline fails immediately
+
+<AccordionGroup>
+  <Accordion title="Verify Claude CLI is configured">
+    Test the Claude CLI:
+    ```bash
+    claude -p "test" "say hello"
+    ```
+  </Accordion>
+  
+  <Accordion title="Check GitHub CLI authentication">
+    ```bash
+    gh auth status
+    ```
+  </Accordion>
+  
+  <Accordion title="Verify repository access">
+    Ensure `MAGPIE_REPO_DIR` points to a valid git repository with remote configured.
+  </Accordion>
+</AccordionGroup>
+
+### Thread not archived after completion
+
+This is expected if `close_thread()` fails. Check that the bot has **Manage Threads** permission in the channel.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Docker Setup" icon="docker" href="/guides/docker-setup">
+    Containerize the Discord bot for easier deployment
+  </Card>
+  <Card title="Pipeline Configuration" icon="gear" href="/configuration/pipeline">
+    Learn about all available pipeline settings
+  </Card>
+  <Card title="Blueprint Engine" icon="sitemap" href="/blueprints/overview">
+    Understand how Magpie orchestrates agent tasks
+  </Card>
+  <Card title="Org-Scoped Repos" icon="building" href="/advanced/org-scoped-repos">
+    Enable dynamic multi-repository support
+  </Card>
+</CardGroup>

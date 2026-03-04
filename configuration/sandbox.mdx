@@ -1,0 +1,467 @@
+---
+title: 'Sandbox Configuration'
+description: 'Configure Daytona sandbox execution, snapshots, and warm pool'
+---
+
+## Overview
+
+Magpie supports two sandbox execution modes:
+
+1. **Local** — commands run via `std::process::Command` (default)
+2. **Daytona** — commands run in remote Daytona sandboxes via REST API (feature-gated)
+
+Daytona sandboxes provide full isolation for concurrent pipeline runs, with support for pre-built snapshots and warm pools for fast acquisition.
+
+## Sandbox Trait
+
+All command execution routes through the `Sandbox` trait:
+
+```rust
+#[async_trait]
+pub trait Sandbox: Send + Sync {
+    fn name(&self) -> &str;
+    fn working_dir(&self) -> &str;
+    async fn exec(&self, command: &str, args: &[&str]) -> Result<ExecOutput>;
+    async fn exec_shell(&self, shell_cmd: &str) -> Result<ExecOutput>;
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>>;
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
+    async fn destroy(&self) -> Result<()>;
+}
+```
+
+Source: `crates/magpie-core/src/sandbox/mod.rs:62-90`
+
+## DaytonaConfig
+
+Configuration for creating Daytona sandboxes:
+
+```rust
+pub struct DaytonaConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub organization_id: Option<String>,
+    pub sandbox_class: String,
+    pub snapshot_name: Option<String>,
+    pub env_vars: HashMap<String, String>,
+    pub volume_id: Option<String>,
+    pub volume_mount_path: Option<String>,
+}
+```
+
+Source: `crates/magpie-core/src/sandbox/mod.rs:45-60`
+
+## Environment Variables
+
+### Basic Settings
+
+<ParamField path="DAYTONA_API_KEY" type="string" required>
+  Daytona API key for authentication.
+
+  **Example**:
+  ```bash
+  DAYTONA_API_KEY=daytona_abc123...
+  ```
+
+  **Note**: When set, all pipeline commands execute inside a Daytona sandbox instead of locally.
+</ParamField>
+
+<ParamField path="DAYTONA_BASE_URL" type="string" default="https://app.daytona.io/api">
+  Daytona API base URL.
+
+  **Example**:
+  ```bash
+  DAYTONA_BASE_URL=https://daytona.company.com/api
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_ORGANIZATION_ID" type="string" optional>
+  Daytona organization ID (for multi-org accounts).
+
+  **Example**:
+  ```bash
+  DAYTONA_ORGANIZATION_ID=org-123456
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_SANDBOX_CLASS" type="string" default="small">
+  Sandbox size class. Available options depend on your Daytona plan:
+  - `small` — 2 CPU, 4 GB RAM
+  - `medium` — 4 CPU, 8 GB RAM
+  - `large` — 8 CPU, 16 GB RAM
+
+  **Example**:
+  ```bash
+  DAYTONA_SANDBOX_CLASS=large
+  ```
+</ParamField>
+
+### Snapshots (Pre-built Images)
+
+<ParamField path="DAYTONA_SNAPSHOT_NAME" type="string" optional>
+  Daytona snapshot name to create sandboxes from. Snapshots are pre-built images with:
+  - Repository cloned
+  - Dependencies installed (e.g. `cargo fetch`, `npm install`)
+  - Services configured
+
+  **Example**:
+  ```bash
+  DAYTONA_SNAPSHOT_NAME=magpie-self
+  ```
+
+  **Performance**:
+  - Cold clone + build: **5-10 minutes**
+  - Snapshot-based creation: **5-10 seconds**
+
+  **Use Case**: Production deployments where fast sandbox acquisition is critical.
+</ParamField>
+
+<ParamField path="DAYTONA_ENV" type="string" optional>
+  Comma-separated `KEY=VALUE` pairs to inject into sandboxes at creation time.
+
+  **Example**:
+  ```bash
+  DAYTONA_ENV="CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...,GH_TOKEN=github_pat_...,DATABASE_URL=postgres://..."
+  ```
+
+  **Use Case**: Pass API keys and secrets to sandboxes without baking them into snapshots.
+
+  **Parsing**:
+  ```rust
+  let env_str = std::env::var("DAYTONA_ENV")?;
+  let env: HashMap<String, String> = env_str
+      .split(',')
+      .filter_map(|pair| {
+          let (k, v) = pair.split_once('=')?;
+          Some((k.trim().to_string(), v.trim().to_string()))
+      })
+      .collect();
+  ```
+
+  Source: `crates/magpie-cli/src/main.rs` (DAYTONA_ENV parsing)
+</ParamField>
+
+### Persistent Volumes (Build Cache)
+
+<ParamField path="DAYTONA_VOLUME_ID" type="string" optional>
+  Persistent volume UUID for build cache. Preserves compiled artifacts across sandbox instances:
+  - Rust: `target/`
+  - Node.js: `node_modules/`, `.next/`
+  - Python: `.venv/`, `__pycache__/`
+
+  **Example**:
+  ```bash
+  DAYTONA_VOLUME_ID=12345678-1234-1234-1234-123456789abc
+  ```
+
+  **Performance**: Speeds up builds by **3-10x** (Rust incremental builds, npm/cargo cache hits).
+</ParamField>
+
+<ParamField path="DAYTONA_VOLUME_MOUNT_PATH" type="string" optional>
+  Mount point for the persistent volume inside the sandbox.
+
+  **Example**:
+  ```bash
+  DAYTONA_VOLUME_MOUNT_PATH=/workspace/target
+  ```
+
+  **Note**: Must be set if `DAYTONA_VOLUME_ID` is set.
+</ParamField>
+
+## Creating Sandboxes
+
+### Cold Creation (Clone + Build)
+
+```rust
+let sandbox = DaytonaSandbox::create(&config, "my-org/my-repo").await?;
+```
+
+Process:
+1. Create sandbox via Daytona API
+2. Clone repo with `gh repo clone my-org/my-repo /workspace/my-org-my-repo`
+3. Sandbox is ready for command execution
+
+**Time**: 2-5 minutes (depends on repo size and network speed)
+
+Source: `crates/magpie-core/src/sandbox/daytona.rs:33-88`
+
+### Snapshot-based Creation (Fast)
+
+```rust
+let sandbox = DaytonaSandbox::create_from_snapshot(
+    &config,
+    "magpie-self",
+    "/workspace/magpie",
+    env_vars,
+    volumes,
+).await?;
+```
+
+Process:
+1. Create sandbox from pre-built snapshot
+2. Wait for sandbox to reach `Started` state (large images: up to 5 minutes)
+3. Configure git (`safe.directory`, user identity, `gh auth setup-git`)
+4. Fix workspace permissions
+
+**Time**: 5-10 seconds (after image pull)
+
+Source: `crates/magpie-core/src/sandbox/daytona.rs:90-221`
+
+## Warm Pool
+
+The warm pool maintains pre-provisioned sandboxes for fast acquisition.
+
+### WarmPoolConfig
+
+```rust
+pub struct WarmPoolConfig {
+    pub pool_size: usize,
+    pub refresh_interval_secs: u64,
+    pub daytona: DaytonaConfig,
+    pub repos: Vec<RepoPoolConfig>,
+}
+```
+
+<ParamField path="pool_size" type="usize">
+  How many sandboxes to keep per repo.
+
+  **Example**: `pool_size: 3` maintains 3 idle sandboxes for each configured repo.
+</ParamField>
+
+<ParamField path="refresh_interval_secs" type="u64">
+  How often (seconds) to refresh idle workspaces with `git fetch` + build check.
+
+  **Example**: `refresh_interval_secs: 300` (5 minutes)
+</ParamField>
+
+<ParamField path="repos" type="Vec<RepoPoolConfig>">
+  Per-repo configurations (see below).
+</ParamField>
+
+Source: `crates/magpie-core/src/sandbox/pool.rs:113-124`
+
+### RepoPoolConfig
+
+```rust
+pub struct RepoPoolConfig {
+    pub repo_name: String,
+    pub repo_full_name: String,
+    pub snapshot_name: String,
+    pub sandbox_class: String,
+    pub base_branch: String,
+    pub build_check_cmd: Option<String>,
+    pub volume_id: Option<String>,
+    pub volume_mount_path: Option<String>,
+    pub env_vars: HashMap<String, String>,
+}
+```
+
+<ParamField path="repo_name" type="String">
+  Short repo name (e.g. `"bnplx"`).
+</ParamField>
+
+<ParamField path="repo_full_name" type="String">
+  Full repo name with org (e.g. `"niteshballa/bnplx"`).
+</ParamField>
+
+<ParamField path="snapshot_name" type="String">
+  Daytona snapshot to create sandboxes from.
+
+  **Example**: `"bnplx-snapshot"`
+</ParamField>
+
+<ParamField path="sandbox_class" type="String">
+  Sandbox size override (per-repo).
+
+  **Example**: `"large"` for heavy builds, `"small"` for docs-only repos.
+</ParamField>
+
+<ParamField path="base_branch" type="String">
+  Branch to track for refresh.
+
+  **Example**: `"main"`
+</ParamField>
+
+<ParamField path="build_check_cmd" type="Option<String>">
+  Command to verify build health during refresh.
+
+  **Example**: `Some("cargo check".to_string())`
+</ParamField>
+
+<ParamField path="volume_id" type="Option<String>">
+  Persistent volume UUID for this repo.
+</ParamField>
+
+<ParamField path="volume_mount_path" type="Option<String>">
+  Volume mount path for this repo.
+</ParamField>
+
+<ParamField path="env_vars" type="HashMap<String, String>">
+  Repo-specific environment variables (merged with pool-level env vars).
+</ParamField>
+
+Source: `crates/magpie-core/src/sandbox/pool.rs:86-108`
+
+### Pool Lifecycle
+
+**1. Provision**
+
+```rust
+let pool = Arc::new(WarmPool::new(config));
+pool.provision().await?;
+```
+
+Creates `pool_size` sandboxes per repo from snapshots, then runs post-provision commands (service start, migrations, etc.).
+
+Source: `crates/magpie-core/src/sandbox/pool.rs:161-198`
+
+**2. Acquire**
+
+```rust
+let workspace = pool.acquire("my-org/my-repo").await?;
+```
+
+Returns an idle sandbox for the given repo, or `None` if the pool is exhausted.
+
+Source: `crates/magpie-core/src/sandbox/pool.rs:295-309`
+
+**3. Release**
+
+```rust
+pool.release(&workspace, "main").await?;
+```
+
+Resets git state (checkout base, clean) while preserving build artifacts, then marks the workspace as idle.
+
+Source: `crates/magpie-core/src/sandbox/pool.rs:314-336`
+
+**4. Refresh Loop**
+
+```rust
+pool.start_refresh_loop().await;
+```
+
+Background task that periodically runs `git fetch` + build check on all idle workspaces.
+
+Source: `crates/magpie-core/src/sandbox/pool.rs:341-428`
+
+**5. Shutdown**
+
+```rust
+pool.shutdown().await;
+```
+
+Stops the refresh loop and destroys all sandboxes.
+
+Source: `crates/magpie-core/src/sandbox/pool.rs:431-457`
+
+## Example Configurations
+
+### Local Execution (Default)
+
+```bash
+# No Daytona env vars → commands run locally
+MAGPIE_REPO_DIR=/home/user/my-project
+```
+
+### Daytona Cold Clone
+
+```bash
+DAYTONA_API_KEY=daytona_abc123...
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_SANDBOX_CLASS=small
+
+MAGPIE_GITHUB_ORG=my-company
+```
+
+### Daytona Snapshot (Fast)
+
+```bash
+DAYTONA_API_KEY=daytona_abc123...
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_SANDBOX_CLASS=large
+DAYTONA_SNAPSHOT_NAME=magpie-self
+DAYTONA_ENV="CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...,GH_TOKEN=github_pat_..."
+
+MAGPIE_GITHUB_ORG=my-company
+```
+
+### Daytona with Persistent Volume
+
+```bash
+DAYTONA_API_KEY=daytona_abc123...
+DAYTONA_SANDBOX_CLASS=large
+DAYTONA_SNAPSHOT_NAME=magpie-self
+DAYTONA_VOLUME_ID=12345678-1234-1234-1234-123456789abc
+DAYTONA_VOLUME_MOUNT_PATH=/workspace/target
+DAYTONA_ENV="CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...,GH_TOKEN=github_pat_..."
+```
+
+### Warm Pool (Code)
+
+```rust
+let pool_config = WarmPoolConfig {
+    pool_size: 2,
+    refresh_interval_secs: 300,
+    daytona: daytona_config,
+    repos: vec![
+        RepoPoolConfig {
+            repo_name: "bnplx".to_string(),
+            repo_full_name: "my-org/bnplx".to_string(),
+            snapshot_name: "bnplx-snapshot".to_string(),
+            sandbox_class: "large".to_string(),
+            base_branch: "main".to_string(),
+            build_check_cmd: Some("cargo check".to_string()),
+            volume_id: Some("12345678-1234-1234-1234-123456789abc".to_string()),
+            volume_mount_path: Some("/workspace/target".to_string()),
+            env_vars: HashMap::new(),
+        },
+    ],
+};
+
+let pool = Arc::new(WarmPool::new(pool_config));
+pool.provision().await?;
+pool.start_refresh_loop().await;
+
+// Use in PipelineConfig
+let config = PipelineConfig {
+    pool: Some(pool),
+    ..Default::default()
+};
+```
+
+## Troubleshooting
+
+### Sandbox Creation Timeout
+
+**Cause**: Large snapshot images (4+ GB) can take up to 5 minutes to start.
+
+**Fix**: The pipeline waits up to 300 seconds. If this isn't enough, check Daytona API logs.
+
+### Git Operations Fail
+
+**Cause**: Snapshot-based sandboxes need `safe.directory` configured.
+
+**Fix**: `DaytonaSandbox::create_from_snapshot` handles this automatically via setup commands.
+
+Source: `crates/magpie-core/src/sandbox/daytona.rs:172-194`
+
+### Permission Denied
+
+**Cause**: Snapshot image was built as `root` but sandbox runs as `daytona` user.
+
+**Fix**: Setup commands run `sudo chmod -R 777 /workspace/magpie` to fix ownership.
+
+**Important**: Only chmod the top-level directory, NOT recursive on large dirs (triggers copy-on-write, fills disk).
+
+Source: `crates/magpie-core/src/sandbox/daytona.rs:160-182`
+
+### Build Cache Miss
+
+**Cause**: Persistent volume not attached.
+
+**Fix**: Verify `DAYTONA_VOLUME_ID` and `DAYTONA_VOLUME_MOUNT_PATH` are set correctly.
+
+## Related Documentation
+
+- [Pipeline Configuration](/configuration/pipeline) — Core pipeline settings
+- [Environment Variables](/configuration/environment) — Complete env var reference

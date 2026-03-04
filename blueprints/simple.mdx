@@ -1,0 +1,307 @@
+---
+title: 'Simple Blueprint'
+description: 'Single-shot agent execution for documentation, typos, and trivial changes'
+icon: 'bolt'
+---
+
+## Overview
+
+The **Simple blueprint** is Magpie's fastest execution path. It's used for tasks that don't require test coverage or iterative debugging:
+
+- Documentation updates (`update readme`, `fix docs`)
+- Typo fixes (`fix typo in error message`)
+- Renames (`rename function foo to bar`)
+- Comment fixes (`fix comment in module.rs`)
+- Formatting (`fix whitespace in config`)
+
+<Note>
+Simple tasks skip the TDD flow entirely — no test writing, no verification phase. The agent makes changes and you're done.
+</Note>
+
+## Task Classification
+
+Magpie automatically classifies tasks as **Simple** if they match any of these keywords:
+
+```rust
+const SIMPLE_KEYWORDS: &[&str] = &[
+    "fix typo",
+    "fix the typo",
+    "update readme",
+    "update the readme",
+    "fix docs",
+    "fix the docs",
+    "update docs",
+    "update the docs",
+    "update changelog",
+    "update the changelog",
+    "rename",
+    "fix comment",
+    "fix comments",
+    "fix spelling",
+    "fix whitespace",
+    "fix formatting",
+    "update license",
+    "fix license",
+];
+```
+
+From `crates/magpie-core/src/pipeline.rs:105-124`
+
+**Keyword matching is case-insensitive** and checks if the task message **contains** any of these phrases.
+
+### Examples
+
+<CodeGroup>
+
+```text Simple (keyword match)
+fix typo in README
+update docs for authentication
+rename Config to Settings
+fix comment in pipeline.rs
+```
+
+```text Standard (not simple)
+add authentication
+implement OAuth2 login
+refactor pipeline engine
+```
+
+</CodeGroup>
+
+## Blueprint Structure
+
+The Simple blueprint has **two steps**:
+
+```mermaid
+graph LR
+    A[validate-workspace] -->|exit 0| B[execute-task]
+    B --> C[Done]
+```
+
+### Step 1: validate-workspace
+
+A sanity check that the sandbox is in the right directory:
+
+```rust
+Step {
+    name: "validate-workspace".to_string(),
+    kind: StepKind::Shell(ShellStep::new("pwd")),
+    condition: Condition::Always,
+    continue_on_error: false,
+}
+```
+
+From `crates/magpie-core/src/pipeline.rs:284-289`
+
+**Why?** Early fail if the sandbox setup is broken — better to catch it here than after the agent runs.
+
+### Step 2: execute-task
+
+Run the agent with the user's task message:
+
+```rust
+Step {
+    name: "execute-task".to_string(),
+    kind: StepKind::Agent(
+        AgentStep::new(&trigger.message)
+            .with_context_from_metadata("chat_history"),
+    ),
+    condition: Condition::Always,
+    continue_on_error: false,
+}
+```
+
+From `crates/magpie-core/src/pipeline.rs:273-280`
+
+**Key details:**
+- `trigger.message` is the raw user input from Discord/Teams/CLI
+- `.with_context_from_metadata("chat_history")` injects the full conversation thread
+- The agent has access to **all files** in the repo via Goose tools (read, edit, glob, grep)
+
+## Full Blueprint Code
+
+Here's the complete builder function:
+
+```rust
+pub fn build_main_blueprint(
+    trigger: &TriggerContext,
+    config: &PipelineConfig,
+    working_dir: &str,
+) -> Result<(Blueprint, StepContext)> {
+    let mut ctx = StepContext::new(PathBuf::from(working_dir));
+    trigger.hydrate(&mut ctx);
+    if let Some(ref dir) = config.trace_dir {
+        ctx.metadata
+            .insert("trace_dir".to_string(), dir.display().to_string());
+    }
+
+    let execute_step = if config.dry_run {
+        Step {
+            name: "execute-task".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("echo").with_args(vec![format!("dry-run: {}", trigger.message)]),
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        }
+    } else {
+        Step {
+            name: "execute-task".to_string(),
+            kind: StepKind::Agent(
+                AgentStep::new(&trigger.message).with_context_from_metadata("chat_history"),
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        }
+    };
+
+    let blueprint = Blueprint::new("magpie-main")
+        .add_step(Step {
+            name: "validate-workspace".to_string(),
+            kind: StepKind::Shell(ShellStep::new("pwd")),
+            condition: Condition::Always,
+            continue_on_error: false,
+        })
+        .add_step(execute_step);
+
+    Ok((blueprint, ctx))
+}
+```
+
+From `crates/magpie-core/src/pipeline.rs:248-293`
+
+## Execution Flow
+
+When you run a Simple task:
+
+1. **Task classification** → `TaskComplexity::Simple`
+2. **Blueprint selection** → `build_main_blueprint()`
+3. **Runner execution**:
+   ```rust
+   let (bp, ctx) = build_main_blueprint(&trigger, config, &working_dir)?;
+   match BlueprintRunner::new(ctx, &*sandbox).run(&bp).await {
+       Ok(ctx) => {
+           last_output = ctx.last_output.clone().unwrap_or_default();
+       }
+       Err(e) => {
+           return Ok(PipelineResult {
+               output: format!("Agent failed in round 1: {e}"),
+               status: PipelineStatus::AgentFailed,
+               // ...
+           });
+       }
+   }
+   ```
+   From `crates/magpie-core/src/pipeline.rs:1033-1053`
+
+4. **CI classification** → Check if any code files changed:
+   ```rust
+   let changed = git.changed_files().await.unwrap_or_default();
+   let run_ci = if changed.is_empty() {
+       false
+   } else {
+       needs_ci(&changed)
+   };
+   ```
+   From `crates/magpie-core/src/pipeline.rs:1058-1073`
+
+5. **CI loop** (if code changed) → Run `cargo clippy` + `cargo test`
+6. **Commit + Push + PR** → Create pull request via `gh`
+
+## When CI Runs
+
+Simple tasks **skip CI** if only docs changed:
+
+```rust
+/// True if any file requires CI checks (tests + lint).
+fn needs_ci(files: &[String]) -> bool {
+    files.iter().any(|f| {
+        let lower = f.to_lowercase();
+        !(
+            lower.ends_with(".md") ||
+            lower.ends_with(".txt") ||
+            lower.ends_with(".mdx") ||
+            lower.starts_with("docs/") ||
+            lower == "readme" ||
+            lower == "license" ||
+            lower == "changelog"
+        )
+    })
+}
+```
+
+From `crates/magpie-core/src/pipeline.rs:1370-1385`
+
+**Example:**
+- Task: `update readme` → Changes `README.md` → **CI skipped**
+- Task: `fix typo in error message` → Changes `src/lib.rs` → **CI runs**
+
+## Dry Run Mode
+
+In dry run mode (used for testing), the agent step is replaced with a shell echo:
+
+```rust
+if config.dry_run {
+    Step {
+        name: "execute-task".to_string(),
+        kind: StepKind::Shell(
+            ShellStep::new("echo").with_args(vec![format!("dry-run: {}", trigger.message)]),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    }
+}
+```
+
+From `crates/magpie-core/src/pipeline.rs:263-271`
+
+**Why?** Lets you test the full pipeline flow (git, CI, PR creation) without consuming Claude API credits.
+
+## Logs
+
+Example execution with structured logs:
+
+```
+[1/2] validate-workspace (shell) → running...
+[1/2] validate-workspace → OK (exit 0)
+[2/2] execute-task (agent) → running...
+[agent] tool: read(README.md)
+[agent] tool: edit(README.md, old="teh", new="the")
+[agent] turns: 2, cost: $0.03
+[2/2] execute-task → OK
+```
+
+From `crates/magpie-core/src/blueprint/runner.rs:46-88`
+
+## Common Pitfalls
+
+<Warning>
+**Simple ≠ No Code Changes**
+
+Simple tasks can modify code (e.g. "rename function foo to bar"). They just don't require the TDD test-writing flow. CI still runs if you change `.rs` files.
+</Warning>
+
+<Tip>
+If your "simple" task involves adding new behavior or fixing a bug, Magpie may misclassify it. You can force TDD mode by using words like "implement" or "add" in your prompt.
+</Tip>
+
+## Performance
+
+Simple tasks are **fast**:
+
+- **Agent turns:** Typically 1-3 (no test writing)
+- **Wall time:** 30-90 seconds (local sandbox)
+- **Cost:** $0.02-0.10 per task (Claude API)
+
+Compare to TDD tasks which can take 5-10 minutes and 20+ agent turns.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="TDD Blueprint" icon="flask" href="/blueprints/tdd">
+    See how Standard-complexity tasks use test-driven development
+  </Card>
+  <Card title="Custom Blueprints" icon="wrench" href="/blueprints/custom">
+    Build your own workflow with Blueprint::new() and .add_step()
+  </Card>
+</CardGroup>

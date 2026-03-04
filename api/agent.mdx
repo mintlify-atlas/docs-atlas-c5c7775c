@@ -1,0 +1,291 @@
+---
+title: Agent
+description: AI agent wrapper for autonomous code generation with tool use
+---
+
+## Overview
+
+The agent module provides `MagpieAgent`, a thin wrapper around Goose's Agent with Magpie-specific defaults. It handles streaming LLM responses, tool execution (file edits, shell commands), and trace logging.
+
+## Core Types
+
+### `MagpieAgent`
+
+Thin wrapper around Goose's Agent with Magpie-specific defaults.
+
+```rust
+pub struct MagpieAgent {
+    config: MagpieConfig,
+    agent: Agent,
+    session_manager: Arc<SessionManager>,
+}
+```
+
+### `MagpieConfig`
+
+Configuration for creating a MagpieAgent.
+
+```rust
+pub struct MagpieConfig {
+    pub provider: String,
+    pub model: String,
+    pub max_turns: u32,
+    pub trace_dir: Option<PathBuf>,
+}
+```
+
+<ParamField path="provider" type="String" default="claude-code">
+  LLM provider name (e.g. "claude-code", "openai")
+</ParamField>
+
+<ParamField path="model" type="String" default="default">
+  Model name to use (e.g. "default", "gpt-4")
+</ParamField>
+
+<ParamField path="max_turns" type="u32" default="10">
+  Maximum conversation turns before stopping
+</ParamField>
+
+<ParamField path="trace_dir" type="Option<PathBuf>">
+  Directory for JSONL trace files. When set, all agent calls are traced
+</ParamField>
+
+**Default Configuration:**
+
+```rust
+MagpieConfig {
+    provider: "claude-code".to_string(),
+    model: "default".to_string(),
+    max_turns: 10,
+    trace_dir: None,
+}
+```
+
+## Methods
+
+### `new()`
+
+Creates a new MagpieAgent with the given configuration.
+
+```rust
+pub fn new(config: MagpieConfig) -> Result<Self>
+```
+
+<ParamField path="config" type="MagpieConfig" required>
+  Agent configuration
+</ParamField>
+
+<ResponseField name="Result<MagpieAgent>" type="MagpieAgent">
+  Returns configured agent instance
+</ResponseField>
+
+**Example:**
+
+```rust
+use magpie_core::{MagpieAgent, MagpieConfig};
+use std::path::PathBuf;
+
+let config = MagpieConfig {
+    provider: "claude-code".to_string(),
+    model: "default".to_string(),
+    max_turns: 5,
+    trace_dir: Some(PathBuf::from("/tmp/traces")),
+};
+
+let agent = MagpieAgent::new(config)?;
+```
+
+### `run()`
+
+Runs a prompt through the agent and returns the assistant's text response.
+
+```rust
+pub async fn run(
+    &self,
+    prompt: &str,
+    working_dir: Option<&PathBuf>,
+    step_name: Option<&str>,
+) -> Result<String>
+```
+
+<ParamField path="prompt" type="&str" required>
+  Natural language prompt for the agent. Must not be empty.
+</ParamField>
+
+<ParamField path="working_dir" type="Option<&PathBuf>">
+  Working directory for agent's file/shell tools. Defaults to process CWD if None.
+</ParamField>
+
+<ParamField path="step_name" type="Option<&str>">
+  Name used for trace logging. Defaults to "agent" if None.
+</ParamField>
+
+<ResponseField name="Result<String>" type="String">
+  Returns the agent's concatenated text response. Tool outputs are included in traces but not in the return value.
+</ResponseField>
+
+**Behavior:**
+
+1. Creates a Goose provider with the configured model
+2. Creates a hidden session with the working directory
+3. Streams agent events (text, tool requests, tool responses)
+4. Concatenates text fragments into final response
+5. Writes JSONL trace if `trace_dir` is configured
+
+**Event Classification:**
+
+- `AgentEvent::Message` with text content → concatenated into response
+- Tool requests/responses → logged in trace
+- Thinking blocks → logged in trace
+- Errors → logged in trace
+
+**Example:**
+
+```rust
+use magpie_core::{MagpieAgent, MagpieConfig};
+use std::path::PathBuf;
+
+let agent = MagpieAgent::new(MagpieConfig::default())?;
+
+let response = agent.run(
+    "Add a health check endpoint to src/main.rs",
+    Some(&PathBuf::from("/workspace/my-repo")),
+    Some("implement"),
+).await?;
+
+println!("Agent response: {}", response);
+```
+
+## Tool Access
+
+The agent has access to Goose's standard tools:
+
+- **File operations**: Read, write, edit files
+- **Shell commands**: Execute arbitrary commands in `working_dir`
+- **Code analysis**: Search, grep, understand codebases
+
+Tools operate within the `working_dir` sandbox. All tool use is automatically traced when `trace_dir` is set.
+
+## Trace Format
+
+When `trace_dir` is configured, each agent call produces a JSONL file with:
+
+```json
+{
+  "step_name": "implement",
+  "prompt": "Add a health check endpoint...",
+  "events": [
+    {"kind": "text", "content": "I'll add a health check...", "timestamp": "..." },
+    {"kind": "tool_request", "content": "[ToolRequest: Edit(...)]", "timestamp": "..." },
+    {"kind": "tool_response", "content": "[ToolResponse: Success]", "timestamp": "..." },
+    {"kind": "text", "content": "Done!", "timestamp": "..." }
+  ],
+  "response": "I'll add a health check... Done!",
+  "duration_ms": 4523
+}
+```
+
+## Error Handling
+
+The `run()` method returns `Result<String>` and can fail for several reasons:
+
+- **Empty prompt**: Prompt must not be empty (validated before execution)
+- **Provider creation failure**: Invalid provider/model config
+- **Session creation failure**: Working directory doesn't exist
+- **Agent execution error**: LLM API failure, tool execution errors
+
+All errors use `anyhow::Result` with context for debugging.
+
+**Example with error handling:**
+
+```rust
+use magpie_core::{MagpieAgent, MagpieConfig};
+
+let agent = MagpieAgent::new(MagpieConfig::default())?;
+
+match agent.run("Fix the bug", None, None).await {
+    Ok(response) => println!("Success: {}", response),
+    Err(e) => eprintln!("Agent failed: {:#}", e),
+}
+```
+
+## Integration with Blueprint Engine
+
+`MagpieAgent` is typically used through `AgentStep` in blueprints:
+
+```rust
+use magpie_core::{AgentStep, Step, StepKind, Condition};
+
+let step = Step {
+    name: "implement".to_string(),
+    kind: StepKind::Agent(
+        AgentStep::new("Add OAuth2 login")
+            .with_max_turns(10)
+            .with_last_output()
+    ),
+    condition: Condition::Always,
+    continue_on_error: false,
+};
+```
+
+See [Blueprint Engine API](/api/blueprint-engine) for details on `AgentStep`.
+
+## Token Streaming
+
+The agent streams tokens from the LLM as they arrive:
+
+- Tokens are concatenated **without** inserting newlines between fragments
+- Tokens already carry their own spacing (e.g. " the", " add")
+- This preserves single-line outputs like commit messages and branch slugs
+
+**Example streaming flow:**
+
+```
+Event 1: "I'll"
+Event 2: " add"
+Event 3: " a"
+Event 4: " health"
+Event 5: " check"
+
+Final response: "I'll add a health check"
+```
+
+## Complete Example
+
+```rust
+use magpie_core::{MagpieAgent, MagpieConfig};
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Configure agent with custom settings
+    let config = MagpieConfig {
+        provider: "claude-code".to_string(),
+        model: "default".to_string(),
+        max_turns: 15,
+        trace_dir: Some(PathBuf::from("./traces")),
+    };
+
+    let agent = MagpieAgent::new(config)?;
+
+    // Run agent with working directory
+    let response = agent.run(
+        "Add a /health endpoint that returns 200 OK with {\"status\": \"healthy\"}",
+        Some(&PathBuf::from("/workspace/my-api")),
+        Some("add-health-endpoint"),
+    ).await?;
+
+    println!("Agent completed: {}", response);
+
+    // Check trace file at ./traces/add-health-endpoint-<timestamp>.jsonl
+    Ok(())
+}
+```
+
+## Sandbox Behavior
+
+In local sandboxes, `MagpieAgent` uses the full Goose agent loop with local tool execution.
+
+In Daytona (remote) sandboxes, `AgentStep` dispatches to `claude -p` inside the sandbox instead of using `MagpieAgent` directly. This is handled automatically by the blueprint engine.
+
+See [Blueprint Engine: AgentStep](/api/blueprint-engine#agentstep) for details.

@@ -1,0 +1,280 @@
+---
+title: 'Pipeline Configuration'
+description: 'Configure pipeline behavior, repository settings, and CI commands'
+---
+
+## Overview
+
+The `PipelineConfig` struct controls how Magpie executes tasks: repository location, base branch, test and lint commands, CI retry limits, and integration settings.
+
+## Configuration Structure
+
+```rust
+pub struct PipelineConfig {
+    pub repo_dir: PathBuf,
+    pub base_branch: String,
+    pub test_command: String,
+    pub lint_command: String,
+    pub max_ci_rounds: u32,
+    pub plane: Option<PlaneConfig>,
+    pub dry_run: bool,
+    pub github_org: Option<String>,
+    pub trace_dir: Option<PathBuf>,
+    pub daytona: Option<DaytonaConfig>,
+    pub pool: Option<Arc<WarmPool>>,
+}
+```
+
+Source: `crates/magpie-core/src/pipeline.rs:26-48`
+
+## Basic Settings
+
+<ParamField path="repo_dir" type="PathBuf" default=".">
+  Path to the git repository to operate on. When `github_org` is set, this is ignored in favor of dynamic repo resolution.
+
+  **Environment Variable**: `MAGPIE_REPO_DIR`
+
+  **Example**:
+  ```bash
+  MAGPIE_REPO_DIR=/home/user/my-project
+  ```
+</ParamField>
+
+<ParamField path="base_branch" type="String" default="main">
+  Base branch for new feature branches. All Magpie branches are created from this branch and PRs target it.
+
+  **Environment Variable**: `MAGPIE_BASE_BRANCH`
+
+  **Example**:
+  ```bash
+  MAGPIE_BASE_BRANCH=develop
+  ```
+</ParamField>
+
+<ParamField path="test_command" type="String" default="cargo test">
+  Command to run tests during the CI loop. Executed after the agent completes its work.
+
+  **Environment Variable**: `MAGPIE_TEST_CMD`
+
+  **Examples**:
+  ```bash
+  MAGPIE_TEST_CMD="cargo test"
+  MAGPIE_TEST_CMD="npm test"
+  MAGPIE_TEST_CMD="pytest tests/"
+  ```
+</ParamField>
+
+<ParamField path="lint_command" type="String" default="cargo clippy">
+  Command to run lints during the CI loop. Executed before tests.
+
+  **Environment Variable**: `MAGPIE_LINT_CMD`
+
+  **Examples**:
+  ```bash
+  MAGPIE_LINT_CMD="cargo clippy"
+  MAGPIE_LINT_CMD="npm run lint"
+  MAGPIE_LINT_CMD="ruff check ."
+  ```
+</ParamField>
+
+<ParamField path="max_ci_rounds" type="u32" default="2">
+  Maximum number of lint→test→fix retry attempts. If CI fails after this many rounds, the pipeline returns `PartialSuccess` status.
+
+  **Environment Variable**: `MAGPIE_MAX_CI_ROUNDS`
+
+  **Example**:
+  ```bash
+  MAGPIE_MAX_CI_ROUNDS=3
+  ```
+
+  **Note**: For Standard and BugFix tasks, the blueprint already runs tests+lint internally. If those pass, the first CI round is skipped (effectively starting at round 2).
+</ParamField>
+
+## Multi-Repo Support
+
+<ParamField path="github_org" type="Option<String>" default="None">
+  GitHub organization to restrict repo access to. When set, Magpie dynamically resolves the target repo from the task message.
+
+  **Environment Variable**: `MAGPIE_GITHUB_ORG`
+
+  **Behavior**:
+  - Parses repo name from patterns like `"fix bug in api-service"` or `"deploy repo api-service"`
+  - Validates the repo belongs to the configured org (rejects cross-org references)
+  - Clones the repo into a temp workspace using `gh repo clone`
+  - Temp directory is automatically cleaned up when the pipeline completes
+
+  **Example**:
+  ```bash
+  MAGPIE_GITHUB_ORG=my-company
+  ```
+
+  **Use Case**: Run a single Magpie instance across multiple repos in the same GitHub organization.
+
+  Source: `crates/magpie-core/src/pipeline.rs:754-790`
+</ParamField>
+
+## Advanced Options
+
+<ParamField path="plane" type="Option<PlaneConfig>" default="None">
+  Optional Plane issue tracking integration. When set, Magpie creates issues at pipeline start and updates them on completion.
+
+  See [Plane Configuration](/configuration/plane) for details.
+</ParamField>
+
+<ParamField path="dry_run" type="bool" default="false">
+  When `true`, agent steps are replaced with shell echo stubs (for testing). Git operations still run, but no actual code changes are made.
+
+  **Use Case**: Testing pipeline orchestration without invoking the LLM.
+</ParamField>
+
+<ParamField path="trace_dir" type="Option<PathBuf>" default="None">
+  Directory for JSONL trace files. When set, all agent calls (Tier 1 and Tier 2) are recorded with timestamps, tool calls, and response metadata.
+
+  **File Format**: `.magpie/traces/magpie-trace-YYYY-MM-DD.jsonl`
+
+  **Example**:
+  ```bash
+  MAGPIE_TRACE_DIR=.magpie/traces
+  ```
+
+  **Use Case**: Debugging agent behavior, auditing LLM usage, and analyzing pipeline performance.
+</ParamField>
+
+<ParamField path="daytona" type="Option<DaytonaConfig>" default="None">
+  When set, pipeline runs execute inside a Daytona sandbox. If `None`, commands execute locally.
+
+  See [Sandbox Configuration](/configuration/sandbox) for details.
+</ParamField>
+
+<ParamField path="pool" type="Option<Arc<WarmPool>>" default="None" feature="daytona">
+  Warm sandbox pool. When set, the pipeline tries to acquire a pre-built sandbox before falling back to cold creation.
+
+  **Feature Flag**: Requires `daytona` feature.
+
+  See [Sandbox Configuration](/configuration/sandbox#warm-pool) for details.
+</ParamField>
+
+## Default Configuration
+
+The default configuration is suitable for Rust projects using Cargo:
+
+```rust
+PipelineConfig {
+    repo_dir: PathBuf::from("."),
+    base_branch: "main".to_string(),
+    test_command: "cargo test".to_string(),
+    lint_command: "cargo clippy".to_string(),
+    max_ci_rounds: 2,
+    plane: None,
+    dry_run: false,
+    github_org: None,
+    trace_dir: None,
+    daytona: None,
+    pool: None,
+}
+```
+
+Source: `crates/magpie-core/src/pipeline.rs:50-67`
+
+## Pipeline Result
+
+Every pipeline run returns a structured `PipelineResult`:
+
+```rust
+pub struct PipelineResult {
+    pub output: String,
+    pub pr_url: Option<String>,
+    pub plane_issue_id: Option<String>,
+    pub ci_passed: bool,
+    pub rounds_used: u32,
+    pub status: PipelineStatus,
+}
+```
+
+### Status Values
+
+<ParamField path="Success" type="PipelineStatus">
+  Agent completed the task and all CI checks passed.
+</ParamField>
+
+<ParamField path="PartialSuccess" type="PipelineStatus">
+  Agent completed the task and opened a PR, but CI checks failed after `max_ci_rounds` attempts.
+</ParamField>
+
+<ParamField path="AgentFailed" type="PipelineStatus">
+  The agent encountered an error during blueprint execution.
+</ParamField>
+
+<ParamField path="SetupFailed" type="PipelineStatus">
+  Pipeline setup failed (git branch creation, sandbox creation, or repo validation).
+</ParamField>
+
+Source: `crates/magpie-core/src/pipeline.rs:70-87`
+
+## Example Configurations
+
+### Rust Project (Default)
+
+```bash
+MAGPIE_REPO_DIR=.
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy"
+MAGPIE_MAX_CI_ROUNDS=2
+```
+
+### Node.js Project
+
+```bash
+MAGPIE_REPO_DIR=/home/user/my-app
+MAGPIE_BASE_BRANCH=develop
+MAGPIE_TEST_CMD="npm test"
+MAGPIE_LINT_CMD="npm run lint"
+MAGPIE_MAX_CI_ROUNDS=3
+```
+
+### Python Project
+
+```bash
+MAGPIE_REPO_DIR=/workspace/api-service
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="pytest tests/"
+MAGPIE_LINT_CMD="ruff check . && mypy ."
+MAGPIE_MAX_CI_ROUNDS=2
+```
+
+### Multi-Repo Setup
+
+```bash
+MAGPIE_GITHUB_ORG=my-company
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy"
+```
+
+**Note**: When `MAGPIE_GITHUB_ORG` is set, `MAGPIE_REPO_DIR` is ignored. Magpie parses the repo name from the task message and clones it dynamically.
+
+## CI Classification
+
+Magpie automatically classifies changed files to determine whether to run CI:
+
+**Docs-only extensions**:
+- `.md`, `.txt`, `.rst`, `.adoc`
+- `.png`, `.jpg`, `.gif`, `.svg`, `.ico`
+- `.json`, `.yml`, `.yaml`
+
+**Docs-only filenames**:
+- `LICENSE`, `CHANGELOG`, `CHANGES`, `AUTHORS`, `CONTRIBUTORS`
+
+**Behavior**:
+- If **all** changed files are docs-only → skip CI
+- Otherwise → run lint + test loop
+- For Standard/BugFix tasks, if the blueprint's built-in test+lint steps already passed, the CI loop is skipped entirely
+
+Source: `crates/magpie-core/src/pipeline.rs:1057-1160`
+
+## Related Documentation
+
+- [Environment Variables](/configuration/environment) — Complete list of all env vars
+- [Plane Configuration](/configuration/plane) — Issue tracking integration
+- [Sandbox Configuration](/configuration/sandbox) — Daytona sandbox setup

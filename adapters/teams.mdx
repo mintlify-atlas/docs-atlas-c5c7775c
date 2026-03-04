@@ -1,0 +1,708 @@
+---
+title: Microsoft Teams Adapter
+description: Deploy Magpie to Microsoft Teams using Azure Bot Framework
+icon: microsoft
+---
+
+The Teams adapter enables Magpie to receive tasks via Microsoft Teams messages. It runs as an HTTP webhook server that handles Bot Framework activities with OAuth2 authentication and optional HMAC signature validation.
+
+## Architecture
+
+The Teams adapter (`magpie-teams`) is built with [Axum](https://github.com/tokio-rs/axum) and integrates with Azure Bot Framework. When a user sends a message:
+
+<Steps>
+  <Step title="Webhook receives activity">
+    Bot Framework POSTs a JSON activity to `/api/messages` with message content and metadata.
+  </Step>
+  
+  <Step title="HMAC validation (optional)">
+    If `TEAMS_HMAC_SECRET` is set, validates the `Authorization` header signature.
+  </Step>
+  
+  <Step title="OAuth2 token acquisition">
+    `AuthManager` fetches and caches a bearer token from Microsoft's OAuth2 endpoint.
+  </Step>
+  
+  <Step title="Pipeline execution">
+    Sends acknowledgment, runs the full autonomous pipeline, and posts the final result.
+  </Step>
+</Steps>
+
+## Setup
+
+### 1. Register an Azure Bot
+
+<Steps>
+  <Step title="Create a Bot Registration">
+    Go to [Azure Portal](https://portal.azure.com) → **Azure Bot** → **Create**
+    
+    - **Bot handle**: Choose a unique name (e.g., `magpie-bot`)
+    - **Subscription**: Select your Azure subscription
+    - **Resource group**: Create or select existing
+    - **Pricing tier**: F0 (free) for development
+  </Step>
+  
+  <Step title="Create an App Registration">
+    Navigate to **Azure Active Directory** → **App registrations** → **New registration**
+    
+    - **Name**: `Magpie Bot`
+    - **Supported account types**: Accounts in any organizational directory (Multitenant)
+    - **Redirect URI**: Leave blank for now
+  </Step>
+  
+  <Step title="Generate a Client Secret">
+    In your app registration:
+    - Go to **Certificates & secrets** → **Client secrets** → **New client secret**
+    - **Description**: `Magpie production secret`
+    - **Expires**: 24 months (or custom)
+    - **Copy the secret value** — you'll need it for `TEAMS_APP_SECRET`
+  </Step>
+  
+  <Step title="Link App to Bot">
+    Back in your **Azure Bot** resource:
+    - Go to **Configuration**
+    - Set **Microsoft App ID** to your app registration's **Application (client) ID**
+    - Save changes
+  </Step>
+</Steps>
+
+### 2. Configure Teams Channel
+
+<Steps>
+  <Step title="Enable Microsoft Teams Channel">
+    In your Azure Bot → **Channels** → **Microsoft Teams** → **Configure**
+  </Step>
+  
+  <Step title="Set Messaging Endpoint">
+    Under **Configuration** → **Messaging endpoint**, set:
+    ```
+    https://your-domain.com/api/messages
+    ```
+    
+    For local development with [ngrok](https://ngrok.com):
+    ```bash
+    ngrok http 3978
+    # Use the generated URL: https://abc123.ngrok.io/api/messages
+    ```
+  </Step>
+</Steps>
+
+### 3. Configure Environment Variables
+
+Create a `.env` file with your Azure credentials:
+
+```bash .env
+# Required: Azure Bot credentials
+TEAMS_APP_ID=00000000-0000-0000-0000-000000000000
+TEAMS_APP_SECRET=your~client.secret_here-1234567890
+
+# Optional: Server listen address (default: 0.0.0.0:3978)
+TEAMS_LISTEN_ADDR=0.0.0.0:3978
+
+# Optional: HMAC signature validation secret
+# (configured in Azure Bot → Configuration → Messaging endpoint settings)
+TEAMS_HMAC_SECRET=your_webhook_secret_here
+
+# Repository configuration
+MAGPIE_REPO_DIR=/path/to/your/repo
+MAGPIE_BASE_BRANCH=main
+MAGPIE_GITHUB_ORG=your-org  # Optional: for org-scoped repo cloning
+
+# CI commands
+MAGPIE_TEST_CMD="npm test"
+MAGPIE_LINT_CMD="npm run lint"
+MAGPIE_MAX_CI_ROUNDS=2
+
+# Optional: Plane.so issue tracking
+PLANE_BASE_URL=https://your-plane.so
+PLANE_API_KEY=your_plane_api_key
+PLANE_WORKSPACE_SLUG=your-workspace
+PLANE_PROJECT_ID=your-project-id
+
+# Optional: Daytona sandbox execution
+DAYTONA_API_KEY=your_daytona_key
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_ORGANIZATION_ID=your-org-id
+DAYTONA_SANDBOX_CLASS=small
+```
+
+<Note>
+The `TEAMS_APP_ID` is your **Application (client) ID** from the Azure AD app registration. The `TEAMS_APP_SECRET` is the **client secret value** (not the secret ID).
+</Note>
+
+### 4. Run the Webhook Server
+
+<CodeGroup>
+```bash Local Development
+cargo run -p magpie-teams
+```
+
+```bash Production (compiled binary)
+./target/release/magpie-teams
+```
+
+```bash With ngrok (for local testing)
+# Terminal 1: Start Magpie
+cargo run -p magpie-teams
+
+# Terminal 2: Expose via ngrok
+ngrok http 3978
+# Update Azure Bot messaging endpoint with ngrok URL
+```
+</CodeGroup>
+
+The server will start on `0.0.0.0:3978` (or your configured `TEAMS_LISTEN_ADDR`).
+
+## Usage
+
+Send a message to your bot in Microsoft Teams:
+
+<CodeGroup>
+```text Direct Message
+@Magpie add a health check endpoint to the API
+```
+
+```text Channel Message
+@Magpie fix the null pointer exception in payment processing
+```
+
+```text Bug Fix with Context
+@Magpie investigate why users are getting 500 errors on /api/checkout and fix the root cause
+```
+</CodeGroup>
+
+Magpie will:
+1. Acknowledge the task: "Working on it..."
+2. Run the full pipeline in the background
+3. Post the final result with PR link and CI status
+
+## Authentication
+
+### OAuth2 Token Management
+
+The `AuthManager` handles Bot Framework OAuth2 token acquisition with automatic caching:
+
+```rust crates/magpie-teams/src/auth.rs:50-93
+pub async fn get_token(&self) -> Result<String> {
+    let mut cache = self.cache.lock().await;
+
+    if let Some(ref cached) = *cache {
+        if Instant::now() < cached.expires_at {
+            return Ok(cached.token.clone());
+        }
+    }
+
+    let resp = self
+        .client
+        .post(&self.token_url)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", &self.app_id),
+            ("client_secret", &self.app_secret),
+            ("scope", SCOPE),
+        ])
+        .send()
+        .await
+        .context("failed to request token")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("token request failed ({status}): {text}");
+    }
+
+    let data: TokenResponse = resp
+        .json()
+        .await
+        .context("failed to parse token response")?;
+
+    let ttl = Duration::from_secs(data.expires_in).saturating_sub(EXPIRY_BUFFER);
+    let expires_at = Instant::now() + ttl;
+    let token = data.access_token.clone();
+
+    *cache = Some(CachedToken {
+        token: data.access_token,
+        expires_at,
+    });
+
+    Ok(token)
+}
+```
+
+**Key features**:
+- Tokens are cached in-memory with 5-minute expiry buffer
+- Automatic refresh when cached token expires
+- Thread-safe via `Arc<Mutex<...>>`
+- Default endpoint: `https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token`
+
+### HMAC Signature Validation
+
+For production deployments, enable webhook signature validation to prevent unauthorized requests:
+
+```rust crates/magpie-teams/src/webhook.rs:46-59
+pub fn validate_hmac(body: &[u8], signature: &str, secret: &str) -> bool {
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(signature) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+
+    mac.verify_slice(&decoded).is_ok()
+}
+```
+
+**Setup in Azure**:
+1. Go to Azure Bot → **Configuration** → **Messaging endpoint**
+2. Enable **Webhook signature validation**
+3. Copy the generated secret to `TEAMS_HMAC_SECRET`
+
+If `TEAMS_HMAC_SECRET` is not set, HMAC validation is skipped (development mode).
+
+## Message Handling
+
+### Mention Stripping
+
+Teams includes `<at>...</at>` XML tags in message text. Magpie strips these before processing:
+
+```rust crates/magpie-teams/src/webhook.rs:62-73
+pub fn strip_teams_mention(text: &str) -> String {
+    let mut result = text.to_string();
+    while let Some(start) = result.find("<at>") {
+        if let Some(end) = result[start..].find("</at>") {
+            let remove_end = start + end + "</at>".len();
+            result = format!("{}{}", &result[..start], &result[remove_end..]);
+        } else {
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+```
+
+**Example**:
+```
+Input:  <at>Magpie</at> fix the login bug
+Output: fix the login bug
+```
+
+### Activity Structure
+
+Bot Framework activities have this JSON structure:
+
+```json
+{
+  "type": "message",
+  "text": "<at>Magpie</at> add tests for payment module",
+  "from": {
+    "name": "Alice",
+    "id": "29:1234567890abcdef"
+  },
+  "conversation": {
+    "id": "19:abcdef1234567890@thread.tacv2"
+  },
+  "serviceUrl": "https://smba.trafficmanager.net/teams/",
+  "id": "1234567890123456789",
+  "channelId": "msteams"
+}
+```
+
+Magpie extracts:
+- `text` → task description (after mention stripping)
+- `from.name` → user attribution
+- `conversation.id` → channel ID for replies
+- `serviceUrl` → Bot Framework API endpoint
+
+## Webhook Endpoints
+
+### POST /api/messages
+
+Main webhook endpoint for Bot Framework activities.
+
+**Request**:
+```http
+POST /api/messages HTTP/1.1
+Content-Type: application/json
+Authorization: HMAC abcd1234base64signature==
+
+{
+  "type": "message",
+  "text": "<at>Magpie</at> fix the bug",
+  "from": { "name": "Alice" },
+  "conversation": { "id": "conv-123" },
+  "serviceUrl": "https://smba.trafficmanager.net/teams/"
+}
+```
+
+**Response**:
+```http
+HTTP/1.1 200 OK
+```
+
+The pipeline runs asynchronously in the background. Magpie sends acknowledgment and results via Bot Framework API (not in the HTTP response).
+
+### GET /health
+
+Health check endpoint for load balancers and monitoring.
+
+**Request**:
+```http
+GET /health HTTP/1.1
+```
+
+**Response**:
+```http
+HTTP/1.1 200 OK
+Content-Type: text/plain
+
+ok
+```
+
+## Deployment Patterns
+
+### Docker Deployment
+
+```dockerfile Dockerfile.teams
+FROM rust:1.75 as builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p magpie-teams
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/magpie-teams /usr/local/bin/
+EXPOSE 3978
+CMD ["magpie-teams"]
+```
+
+```yaml docker-compose.yml
+version: '3.8'
+
+services:
+  magpie-teams:
+    build:
+      context: .
+      dockerfile: Dockerfile.teams
+    ports:
+      - "3978:3978"
+    environment:
+      - TEAMS_APP_ID=${TEAMS_APP_ID}
+      - TEAMS_APP_SECRET=${TEAMS_APP_SECRET}
+      - TEAMS_HMAC_SECRET=${TEAMS_HMAC_SECRET}
+      - MAGPIE_REPO_DIR=/workspace
+      - RUST_LOG=info
+    volumes:
+      - ./workspace:/workspace
+      - ~/.gitconfig:/root/.gitconfig:ro
+      - ~/.ssh:/root/.ssh:ro
+    restart: unless-stopped
+```
+
+### Azure Container Instances
+
+```bash
+az container create \
+  --resource-group magpie-rg \
+  --name magpie-teams \
+  --image your-registry.azurecr.io/magpie-teams:latest \
+  --cpu 1 \
+  --memory 1 \
+  --ports 3978 \
+  --dns-name-label magpie-teams \
+  --environment-variables \
+    TEAMS_APP_ID=$TEAMS_APP_ID \
+    TEAMS_APP_SECRET=$TEAMS_APP_SECRET \
+    MAGPIE_REPO_DIR=/workspace \
+    RUST_LOG=info
+```
+
+### Kubernetes Deployment
+
+```yaml magpie-teams.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: magpie-teams
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: magpie-teams
+  template:
+    metadata:
+      labels:
+        app: magpie-teams
+    spec:
+      containers:
+      - name: magpie
+        image: your-registry/magpie-teams:latest
+        ports:
+        - containerPort: 3978
+        envFrom:
+        - secretRef:
+            name: magpie-teams-secrets
+        - configMapRef:
+            name: magpie-config
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3978
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3978
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: magpie-teams
+spec:
+  selector:
+    app: magpie-teams
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 3978
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: magpie-teams-secrets
+type: Opaque
+stringData:
+  TEAMS_APP_ID: "00000000-0000-0000-0000-000000000000"
+  TEAMS_APP_SECRET: "your~secret_here"
+  TEAMS_HMAC_SECRET: "your_hmac_secret"
+```
+
+### Systemd Service
+
+```ini /etc/systemd/system/magpie-teams.service
+[Unit]
+Description=Magpie Teams Webhook
+After=network.target
+
+[Service]
+Type=simple
+User=magpie
+WorkingDirectory=/opt/magpie
+EnvironmentFile=/opt/magpie/.env
+ExecStart=/opt/magpie/magpie-teams
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Monitoring & Debugging
+
+### Logging
+
+Control verbosity with `RUST_LOG`:
+
+<CodeGroup>
+```bash Info (default)
+RUST_LOG=info cargo run -p magpie-teams
+```
+
+```bash Debug (verbose)
+RUST_LOG=debug cargo run -p magpie-teams
+```
+
+```bash Module-specific
+RUST_LOG=magpie_core=debug,magpie_teams=trace cargo run -p magpie-teams
+```
+</CodeGroup>
+
+Key log messages:
+```
+info  magpie-teams listening on 0.0.0.0:3978
+info  received Teams message user="Alice" task="fix the bug"
+info  pipeline complete status=Success pr=Some("https://github.com/org/repo/pull/42")
+warn  HMAC validation failed
+error failed to send ack: token request failed (401)
+```
+
+### Health Checks
+
+```bash
+curl http://localhost:3978/health
+# Expected: "ok" with 200 status
+```
+
+For production monitoring:
+```bash
+# Prometheus-style endpoint (implement custom)
+curl http://localhost:3978/metrics
+
+# Kubernetes readiness probe
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 3978
+```
+
+### Common Issues
+
+<AccordionGroup>
+  <Accordion title="401 Unauthorized on token acquisition">
+    **Invalid credentials**: Verify `TEAMS_APP_ID` and `TEAMS_APP_SECRET` match your Azure AD app registration.
+    
+    ```bash
+    # Test token acquisition manually
+    curl -X POST https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token \
+      -d "grant_type=client_credentials" \
+      -d "client_id=YOUR_APP_ID" \
+      -d "client_secret=YOUR_SECRET" \
+      -d "scope=https://api.botframework.com/.default"
+    ```
+    
+    **Common causes**:
+    - Wrong secret (copied secret ID instead of value)
+    - Expired secret (Azure secrets have configurable lifetimes)
+    - Wrong tenant (multitenant vs single-tenant mismatch)
+  </Accordion>
+  
+  <Accordion title="HMAC validation failures">
+    **Signature mismatch**: Ensure `TEAMS_HMAC_SECRET` matches the webhook secret in Azure Bot configuration.
+    
+    **Debug logs**:
+    ```
+    warn  HMAC validation failed
+    ```
+    
+    **Fix**:
+    1. Go to Azure Bot → Configuration → Messaging endpoint
+    2. Copy the **Webhook signature secret**
+    3. Update `TEAMS_HMAC_SECRET` in `.env`
+    4. Restart Magpie
+    
+    **Disable for testing**:
+    ```bash
+    unset TEAMS_HMAC_SECRET
+    cargo run -p magpie-teams
+    ```
+  </Accordion>
+  
+  <Accordion title="Webhook receives no messages">
+    **Messaging endpoint not configured**: Verify Azure Bot → Configuration → Messaging endpoint is set to your server's public URL.
+    
+    **Firewall blocking**: Ensure your server accepts inbound HTTPS on port 443 (or HTTP on 80 for ngrok).
+    
+    **Test connectivity**:
+    ```bash
+    # From Azure Bot → Test in Web Chat
+    # Send a message and check Magpie logs
+    ```
+    
+    **ngrok for local testing**:
+    ```bash
+    ngrok http 3978
+    # Update messaging endpoint to: https://abc123.ngrok.io/api/messages
+    ```
+  </Accordion>
+  
+  <Accordion title="Bot doesn't reply in Teams">
+    **serviceUrl mismatch**: The `serviceUrl` in the activity must match the Bot Framework endpoint.
+    
+    **Token expired**: `AuthManager` caches tokens for 3600 seconds. If the bot was idle for >1 hour, the first reply may fail. Check logs for "token request failed".
+    
+    **Rate limiting**: Bot Framework has rate limits (60 requests/minute per bot). High-frequency replies may be throttled.
+    
+    **Debug logs**:
+    ```
+    error failed to send pipeline result: token request failed (401)
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Implementation Reference
+
+The Teams adapter implements the `ChatPlatform` trait:
+
+```rust crates/magpie-teams/src/adapter.rs:38-79
+#[async_trait]
+impl ChatPlatform for TeamsPlatform {
+    fn name(&self) -> &str {
+        "teams"
+    }
+
+    async fn fetch_history(&self, _channel_id: &str) -> Result<String> {
+        // Returns empty — Graph API thread history not yet integrated.
+        // Empty string keeps agent prompts clean (no placeholder noise).
+        Ok(String::new())
+    }
+
+    async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
+        let token = self.auth.get_token().await?;
+        let url = format!(
+            "{}/v3/conversations/{}/activities",
+            self.service_url, channel_id
+        );
+
+        let body = serde_json::json!({
+            "type": "message",
+            "text": text,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("failed to send Teams message")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("Teams send_message failed ({status}): {text}");
+        }
+
+        Ok(())
+    }
+}
+```
+
+### Source Files
+
+- `crates/magpie-teams/src/main.rs` — Entry point, Axum server setup
+- `crates/magpie-teams/src/adapter.rs` — `ChatPlatform` implementation
+- `crates/magpie-teams/src/webhook.rs` — Activity handling, HMAC validation
+- `crates/magpie-teams/src/auth.rs` — OAuth2 token management with caching
+- `crates/magpie-teams/src/reply.rs` — Pipeline result formatting
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Discord Adapter" icon="discord" href="/adapters/discord">
+    Deploy Magpie to Discord with thread-based task management
+  </Card>
+  
+  <Card title="CLI Adapter" icon="terminal" href="/adapters/cli">
+    Run Magpie locally from the command line
+  </Card>
+  
+  <Card title="Custom Adapter" icon="code" href="/adapters/custom">
+    Build your own adapter for any chat platform
+  </Card>
+  
+  <Card title="Docker Setup" icon="docker" href="/guides/docker-setup">
+    Deploy Magpie with Docker and Kubernetes
+  </Card>
+</CardGroup>

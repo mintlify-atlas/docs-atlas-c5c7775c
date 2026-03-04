@@ -1,0 +1,600 @@
+---
+title: CLI Adapter
+description: Run Magpie locally from the command line for development and testing
+icon: terminal
+---
+
+The CLI adapter enables local Magpie usage without chat platform integration. Perfect for development, testing, and CI/CD automation.
+
+## Overview
+
+The `magpie-cli` binary provides three modes:
+
+<CardGroup cols={3}>
+  <Card title="Single Agent" icon="message">
+    Run a single AI agent prompt without pipeline orchestration.
+  </Card>
+  
+  <Card title="Full Pipeline" icon="workflow">
+    Execute the complete autonomous coding workflow (branch, code, CI, PR).
+  </Card>
+  
+  <Card title="Blueprint Demo" icon="play">
+    See the blueprint engine in action with a simple two-step workflow.
+  </Card>
+</CardGroup>
+
+## Installation
+
+<CodeGroup>
+```bash From Source
+# Clone the repository
+git clone https://github.com/your-org/magpie.git
+cd magpie
+
+# Build the CLI
+cargo build --release -p magpie-cli
+
+# Binary location: ./target/release/magpie-cli
+```
+
+```bash Install System-Wide
+cargo install --path crates/magpie-cli
+
+# Now available as: magpie-cli
+```
+
+```bash Run Without Installing
+cargo run -p magpie-cli -- <args>
+```
+</CodeGroup>
+
+## Usage
+
+### Single Agent Mode
+
+Run a single AI agent prompt for quick coding tasks:
+
+<CodeGroup>
+```bash Basic Usage
+magpie-cli "explain how the authentication middleware works"
+```
+
+```bash Code Generation
+magpie-cli "write a Rust function to parse ISO 8601 timestamps"
+```
+
+```bash Debugging
+magpie-cli "analyze the error in this stack trace: <paste trace>"
+```
+</CodeGroup>
+
+**Behavior**:
+- Uses `MagpieAgent` (Goose-powered agent with file/shell access)
+- Runs in current directory
+- Output printed to stdout
+- No git operations, no CI, no PR creation
+
+**Example output**:
+```
+The authentication middleware in src/auth.rs uses JWT validation...
+[Agent provides detailed explanation with code references]
+```
+
+### Full Pipeline Mode
+
+Execute the complete autonomous coding workflow:
+
+<CodeGroup>
+```bash Basic Pipeline
+magpie-cli --pipeline "add a health check endpoint"
+```
+
+```bash With Tracing
+magpie-cli --trace --pipeline "fix the race condition in user sessions"
+```
+
+```bash Complex Task
+magpie-cli --pipeline "refactor the database layer to use async/await and add connection pooling"
+```
+</CodeGroup>
+
+**Workflow**:
+1. Creates a feature branch (e.g., `magpie/add-health-check-endpoint-2`)
+2. Classifies task → selects appropriate blueprint (Simple/TDD/Diagnostic)
+3. Runs agent coding work via blueprint steps
+4. Executes CI loop (lint + test, up to `MAGPIE_MAX_CI_ROUNDS`)
+5. Commits changes with AI-generated commit message
+6. Pushes to remote and creates PR via `gh` CLI
+7. Updates Plane issue if configured
+
+**Example output**:
+```
+=== Magpie Full Pipeline ===
+
+Task: add a health check endpoint
+
+Repo:   "/home/user/myproject"
+Branch: main
+Test:   cargo test
+Lint:   cargo clippy
+Rounds: 2
+Plane:  disabled
+Trace:  enabled
+
+[Pipeline execution logs...]
+
+=== Pipeline Result ===
+Status:     Success
+CI passed:  true
+Rounds:     1
+PR:         https://github.com/org/repo/pull/42
+
+--- Output ---
+Created branch: magpie/add-health-check-endpoint-1
+Blueprint: simple (1 agent step)
+Agent completed in 45s
+Lint passed
+Tests passed (3/3)
+Commit: 8a9f2c1 "Add health check endpoint at /health"
+PR created: #42
+```
+
+### Blueprint Demo Mode
+
+See the blueprint engine in action with a simple demo workflow:
+
+```bash
+magpie-cli --demo
+```
+
+**Demo workflow**:
+1. **ShellStep**: Runs `ls -la` in current directory
+2. **AgentStep**: Summarizes the directory listing in 2-3 sentences
+
+**Example output**:
+```
+=== Magpie Blueprint Demo ===
+
+Running blueprint: demo-blueprint
+
+[Step 1/2] list-files (Shell)
+Executing: ls -la
+[Directory listing output...]
+
+[Step 2/2] summarize (Agent)
+Prompt: Summarize the directory listing from the previous step in 2-3 sentences.
+[Agent response...]
+
+=== Result ===
+This directory contains a Rust project with a Cargo.toml file and src/ directory. 
+There are 15 files total, including documentation in README.md and configuration in .gitignore. 
+The project appears to be actively developed with recent modifications.
+```
+
+## CLI Flags
+
+### --pipeline
+
+Run the full autonomous coding pipeline.
+
+**Syntax**:
+```bash
+magpie-cli --pipeline <task description>
+```
+
+**Examples**:
+```bash
+# Single-word task
+magpie-cli --pipeline "add tests"
+
+# Multi-word task
+magpie-cli --pipeline "refactor the API to use async handlers"
+
+# Complex task with context
+magpie-cli --pipeline "fix the bug where users can't log in after password reset"
+```
+
+**Requirements**:
+- Must be in a git repository
+- Git working directory must be clean (uncommitted changes will cause errors)
+- `gh` CLI must be authenticated for PR creation
+- Environment variables must be configured (see Configuration below)
+
+### --trace
+
+Enable JSONL trace logging to `.magpie/traces/`.
+
+**Syntax**:
+```bash
+magpie-cli --trace --pipeline <task>
+```
+
+**Output location**:
+```
+<repo_dir>/.magpie/traces/trace_<timestamp>.jsonl
+```
+
+**Trace format** (JSONL):
+```json
+{"timestamp":"2026-03-04T12:34:56Z","event":"pipeline_start","task":"add health check"}
+{"timestamp":"2026-03-04T12:34:57Z","event":"branch_created","branch":"magpie/add-health-check-1"}
+{"timestamp":"2026-03-04T12:35:42Z","event":"agent_complete","duration_secs":45}
+{"timestamp":"2026-03-04T12:35:50Z","event":"ci_passed","round":1}
+{"timestamp":"2026-03-04T12:36:01Z","event":"pr_created","url":"https://github.com/org/repo/pull/42"}
+```
+
+**Use cases**:
+- Debugging pipeline failures
+- Performance analysis
+- Auditing agent actions
+- Building custom monitoring dashboards
+
+### --demo
+
+Run the blueprint engine demo (no arguments).
+
+**Syntax**:
+```bash
+magpie-cli --demo
+```
+
+**Purpose**:
+- Verify Magpie installation
+- Understand blueprint execution model
+- Test agent connectivity (requires Claude API access)
+
+## Configuration
+
+### Environment Variables
+
+Create a `.env` file in your repository root or set environment variables:
+
+```bash .env
+# Repository settings
+MAGPIE_REPO_DIR=/path/to/your/repo  # Default: current directory
+MAGPIE_BASE_BRANCH=main             # Default: "main"
+MAGPIE_GITHUB_ORG=your-org          # Optional: for org-scoped cloning
+
+# CI commands
+MAGPIE_TEST_CMD="cargo test"        # Default: "cargo test"
+MAGPIE_LINT_CMD="cargo clippy"      # Default: "cargo clippy"
+MAGPIE_MAX_CI_ROUNDS=2              # Default: 2
+
+# Optional: Plane.so integration
+PLANE_BASE_URL=https://your-plane.so
+PLANE_API_KEY=your_api_key
+PLANE_WORKSPACE_SLUG=your-workspace
+PLANE_PROJECT_ID=your-project-id
+
+# Optional: Daytona sandbox execution
+DAYTONA_API_KEY=your_daytona_key
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_ORGANIZATION_ID=your-org-id
+DAYTONA_SANDBOX_CLASS=small         # Options: small, medium, large
+DAYTONA_SNAPSHOT_NAME=myproject-snapshot
+
+# Optional: Daytona environment variables (comma-separated KEY=VALUE pairs)
+DAYTONA_ENV="NODE_ENV=production,DEBUG=false"
+
+# Optional: Daytona volume mount
+DAYTONA_VOLUME_ID=vol-abc123
+DAYTONA_VOLUME_MOUNT_PATH=/workspace/data
+```
+
+### Pipeline Config Construction
+
+The CLI builds `PipelineConfig` from environment variables:
+
+```rust crates/magpie-cli/src/main.rs:110-157
+fn build_pipeline_config(trace_enabled: bool) -> magpie_core::PipelineConfig {
+    let plane = match (
+        std::env::var("PLANE_BASE_URL"),
+        std::env::var("PLANE_API_KEY"),
+        std::env::var("PLANE_WORKSPACE_SLUG"),
+        std::env::var("PLANE_PROJECT_ID"),
+    ) {
+        (Ok(base_url), Ok(api_key), Ok(workspace_slug), Ok(project_id)) => Some(PlaneConfig {
+            base_url,
+            api_key,
+            workspace_slug,
+            project_id,
+        }),
+        _ => None,
+    };
+
+    let repo_dir = std::env::var("MAGPIE_REPO_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let trace_dir = if trace_enabled {
+        Some(magpie_core::trace::default_trace_dir(&repo_dir))
+    } else {
+        None
+    };
+
+    PipelineConfig {
+        repo_dir,
+        base_branch: std::env::var("MAGPIE_BASE_BRANCH").unwrap_or_else(|_| "main".to_string()),
+        test_command: std::env::var("MAGPIE_TEST_CMD").unwrap_or_else(|_| "cargo test".to_string()),
+        lint_command: std::env::var("MAGPIE_LINT_CMD")
+            .unwrap_or_else(|_| "cargo clippy".to_string()),
+        max_ci_rounds: std::env::var("MAGPIE_MAX_CI_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+        plane,
+        dry_run: false,
+        github_org: std::env::var("MAGPIE_GITHUB_ORG").ok(),
+        trace_dir,
+        daytona: read_daytona_config(),
+        #[cfg(feature = "daytona")]
+        pool: None,
+    }
+}
+```
+
+## Examples
+
+### Local Development Workflow
+
+```bash
+# 1. Start with a clean branch
+git checkout main
+git pull origin main
+
+# 2. Run Magpie pipeline
+magpie-cli --trace --pipeline "add rate limiting to the API"
+
+# 3. Review the created PR
+gh pr view --web
+
+# 4. Check trace logs
+cat .magpie/traces/trace_*.jsonl | jq
+```
+
+### Testing Different Blueprints
+
+<CodeGroup>
+```bash Simple Blueprint (single agent call)
+magpie-cli --pipeline "update README with installation instructions"
+```
+
+```bash TDD Blueprint (test-first)
+magpie-cli --pipeline "add a new feature: user profile avatars"
+```
+
+```bash Diagnostic Blueprint (bug investigation)
+magpie-cli --pipeline "fix the null pointer exception in payment processing"
+```
+</CodeGroup>
+
+### CI/CD Integration
+
+```yaml .github/workflows/magpie.yml
+name: Magpie Automated Fixes
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  magpie:
+    if: github.event.label.name == 'magpie'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Build Magpie
+        run: cargo build --release -p magpie-cli
+      
+      - name: Run Magpie Pipeline
+        env:
+          MAGPIE_GITHUB_ORG: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./target/release/magpie-cli --trace --pipeline "${{ github.event.issue.title }}"
+```
+
+### Debugging Agent Behavior
+
+```bash
+# Enable verbose logging
+RUST_LOG=debug magpie-cli --trace --pipeline "your task"
+
+# Check trace for agent tool calls
+cat .magpie/traces/trace_*.jsonl | jq 'select(.event=="tool_call")'
+
+# Analyze step durations
+cat .magpie/traces/trace_*.jsonl | jq 'select(.duration_secs) | {event, duration_secs}'
+```
+
+## ChatPlatform Implementation
+
+The CLI uses a minimal `ChatPlatform` implementation:
+
+```rust crates/magpie-cli/src/main.rs:92-108
+struct CliPlatform;
+
+#[async_trait::async_trait]
+impl magpie_core::ChatPlatform for CliPlatform {
+    fn name(&self) -> &str {
+        "cli"
+    }
+
+    async fn fetch_history(&self, _channel_id: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    async fn send_message(&self, _channel_id: &str, _text: &str) -> Result<()> {
+        Ok(())
+    }
+}
+```
+
+**Key characteristics**:
+- `name()` returns `"cli"` for logging/debugging
+- `fetch_history()` returns empty (no chat context needed)
+- `send_message()` is a no-op (output goes to stdout)
+- `close_thread()` uses default no-op implementation
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Error: not a git repository">
+    **Cause**: Running `--pipeline` outside a git repository.
+    
+    **Fix**:
+    ```bash
+    cd /path/to/your/git/repo
+    magpie-cli --pipeline "your task"
+    ```
+    
+    Or set `MAGPIE_REPO_DIR`:
+    ```bash
+    export MAGPIE_REPO_DIR=/path/to/repo
+    magpie-cli --pipeline "your task"
+    ```
+  </Accordion>
+  
+  <Accordion title="Error: uncommitted changes">
+    **Cause**: Git working directory has uncommitted changes.
+    
+    **Fix**:
+    ```bash
+    # Commit or stash changes
+    git add .
+    git commit -m "WIP"
+    
+    # Or stash
+    git stash
+    
+    # Now run Magpie
+    magpie-cli --pipeline "your task"
+    ```
+  </Accordion>
+  
+  <Accordion title="Error: gh CLI not authenticated">
+    **Cause**: PR creation requires `gh` CLI with valid authentication.
+    
+    **Fix**:
+    ```bash
+    gh auth login
+    # Follow prompts to authenticate with GitHub
+    
+    # Verify
+    gh auth status
+    ```
+  </Accordion>
+  
+  <Accordion title="Pipeline runs but CI fails repeatedly">
+    **Cause**: Agent fixes aren't resolving test/lint failures within `MAGPIE_MAX_CI_ROUNDS`.
+    
+    **Debug**:
+    ```bash
+    # Enable tracing
+    magpie-cli --trace --pipeline "your task"
+    
+    # Check CI failure logs
+    cat .magpie/traces/trace_*.jsonl | jq 'select(.event=="ci_failed")'
+    ```
+    
+    **Increase rounds**:
+    ```bash
+    export MAGPIE_MAX_CI_ROUNDS=5
+    magpie-cli --pipeline "your task"
+    ```
+  </Accordion>
+  
+  <Accordion title="Agent doesn't have file/shell access">
+    **Cause**: Running in single-agent mode (not `--pipeline`).
+    
+    **Behavior**:
+    - Single agent mode: File/shell tools available
+    - Pipeline mode: Blueprint orchestration with full tool access
+    
+    **Verify**:
+    ```bash
+    # This has file access:
+    magpie-cli "read src/main.rs and explain the main function"
+    
+    # This runs full pipeline:
+    magpie-cli --pipeline "refactor src/main.rs"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Performance Tips
+
+### Reduce Pipeline Overhead
+
+<CodeGroup>
+```bash Skip CI (dry run)
+export MAGPIE_DRY_RUN=true
+magpie-cli --pipeline "your task"
+```
+
+```bash Reduce CI rounds
+export MAGPIE_MAX_CI_ROUNDS=1
+magpie-cli --pipeline "your task"
+```
+
+```bash Fast lint command
+export MAGPIE_LINT_CMD="cargo check"  # Faster than clippy
+magpie-cli --pipeline "your task"
+```
+</CodeGroup>
+
+### Optimize Agent Performance
+
+```bash
+# Use local Daytona sandbox (faster than remote)
+export DAYTONA_SANDBOX_CLASS=small
+export DAYTONA_SNAPSHOT_NAME=myproject-dev  # Pre-built snapshot
+
+magpie-cli --pipeline "your task"
+```
+
+### Parallel Development
+
+```bash
+# Terminal 1: Feature work
+magpie-cli --pipeline "add user authentication"
+
+# Terminal 2: Bug fix (different repo)
+cd ~/another-project
+magpie-cli --pipeline "fix the race condition"
+
+# Terminal 3: Documentation
+cd ~/docs-repo
+magpie-cli --pipeline "update API reference for v2.0"
+```
+
+## Source Files
+
+- `crates/magpie-cli/src/main.rs` — Entry point, argument parsing, all three modes
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Discord Adapter" icon="discord" href="/adapters/discord">
+    Deploy Magpie to Discord for team collaboration
+  </Card>
+  
+  <Card title="Teams Adapter" icon="microsoft" href="/adapters/teams">
+    Integrate Magpie with Microsoft Teams
+  </Card>
+  
+  <Card title="Custom Adapter" icon="code" href="/adapters/custom">
+    Build your own adapter for any platform
+  </Card>
+  
+  <Card title="Blueprint Engine" icon="diagram-project" href="/api/blueprint-engine">
+    Deep dive into blueprint orchestration
+  </Card>
+</CardGroup>

@@ -1,0 +1,486 @@
+---
+title: Pipeline Flow
+description: Full execution flow from task receipt to pull request creation
+---
+
+The Magpie pipeline orchestrates the complete workflow from receiving a task to opening a pull request. This page documents the full `run_pipeline()` flow with real code examples.
+
+## Overview
+
+```
+@magpie in chat thread
+  → Read thread context
+  → Resolve target repo (org-scoped, if configured)
+  → Auto-create Plane issue
+  → Generate branch name (Tier 1: Claude CLI)
+  → Create git branch (with collision handling)
+  → Classify task → Simple | Standard | BugFix
+  → Run blueprint:
+      Simple   → single-shot agent call
+      Standard → TDD: scan → plan → write tests → verify fail → implement → test → lint
+      BugFix   → Diagnostic: scan → investigate → plan → regression test → verify fail → fix → test → lint
+  → Classify diff (docs-only? skip CI)
+  → CI loop: lint → test → fix (max 2 rounds)
+  → Generate commit message (Tier 1: Claude CLI)
+  → Commit → Push → Open PR
+  → Reply in thread → Archive thread
+  → Update Plane issue
+  → Destroy devbox
+```
+
+## Pipeline Configuration
+
+```rust title="pipeline.rs:24-67"
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    pub repo_dir: PathBuf,
+    pub base_branch: String,
+    pub test_command: String,
+    pub lint_command: String,
+    pub max_ci_rounds: u32,
+    pub plane: Option<PlaneConfig>,
+    /// When true, agent steps are replaced with shell echo stubs (for testing).
+    pub dry_run: bool,
+    /// GitHub org to restrict repo access to. When set, the pipeline resolves
+    /// the target repo from the task message and clones it into a temp workspace.
+    pub github_org: Option<String>,
+    /// Directory for JSONL trace files. When set, all agent calls are traced.
+    pub trace_dir: Option<PathBuf>,
+    /// When set, pipeline runs execute inside a Daytona sandbox.
+    pub daytona: Option<DaytonaConfig>,
+    /// Warm sandbox pool. When set, the pipeline tries to acquire a pre-built
+    /// sandbox before falling back to cold creation.
+    #[cfg(feature = "daytona")]
+    pub pool: Option<Arc<crate::sandbox::pool::WarmPool>>,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            repo_dir: PathBuf::from("."),
+            base_branch: "main".to_string(),
+            test_command: "cargo test".to_string(),
+            lint_command: "cargo clippy".to_string(),
+            max_ci_rounds: 2,
+            plane: None,
+            dry_run: false,
+            github_org: None,
+            trace_dir: None,
+            daytona: None,
+            #[cfg(feature = "daytona")]
+            pool: None,
+        }
+    }
+}
+```
+
+## Step-by-Step Execution
+
+### 1. Fetch Conversation History
+
+The chat thread becomes the requirements document:
+
+```rust title="pipeline.rs:737-747"
+pub async fn run_pipeline(
+    platform: &dyn ChatPlatform,
+    channel_id: &str,
+    user: &str,
+    task: &str,
+    config: &PipelineConfig,
+) -> Result<PipelineResult> {
+    // 1. Fetch conversation history
+    let history = platform.fetch_history(channel_id).await?;
+
+    let trigger = TriggerContext {
+        source: platform.name().to_string(),
+        channel_id: channel_id.to_string(),
+        user: user.to_string(),
+        message: task.to_string(),
+        chat_history: history,
+    };
+```
+
+### 2. Create Sandbox
+
+Either local or remote (Daytona), with optional repo cloning:
+
+```rust title="pipeline.rs:750-909"
+// If github_org is set, resolve and clone the repo
+let sandbox: Box<dyn Sandbox> = if let Some(ref org) = config.github_org {
+    let repo_name = match repo::parse_repo_from_message(task) {
+        Some(name) => name,
+        None => {
+            return Ok(PipelineResult {
+                output: "Setup failed: could not identify a target repo".to_string(),
+                status: PipelineStatus::SetupFailed,
+                // ...
+            });
+        }
+    };
+
+    let full_name = format!("{org}/{repo_name}");
+    repo::validate_org(&full_name, org)?;
+
+    // Try pool-first acquisition (warm sandbox), then cold clone
+    #[cfg(feature = "daytona")]
+    if let Some(ref pool) = config.pool {
+        match pool.acquire(&full_name).await {
+            Some(ws) => Box::new(PooledSandbox::new(ws, pool, config.base_branch.clone())),
+            None => {
+                // Fallback to Daytona cold clone or LocalSandbox
+            }
+        }
+    }
+} else {
+    Box::new(LocalSandbox::from_path(config.repo_dir.clone()))
+};
+```
+
+<Info>
+When `github_org` is set, Magpie parses the repo name from patterns like `"fix bug in api-service"` and clones it dynamically.
+</Info>
+
+### 3. Create Plane Issue (Optional)
+
+Auto-create a tracking issue if Plane is configured:
+
+```rust title="pipeline.rs:914-936"
+let plane_issue_id = if let Some(plane_cfg) = &config.plane {
+    match PlaneClient::new(plane_cfg.clone()) {
+        Ok(client) => {
+            let desc = format!("<p>Task from {user} via {}: {task}</p>", platform.name());
+            match client.create_issue(task, &desc).await {
+                Ok(id) => {
+                    info!(issue_id = %id, "created Plane issue");
+                    Some(id)
+                }
+                Err(e) => {
+                    warn!("failed to create Plane issue: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            warn!("failed to create Plane client: {e}");
+            None
+        }
+    }
+} else {
+    None
+};
+```
+
+### 4. Generate Branch Name
+
+Tier 1 Claude call for semantic branch slugs:
+
+```rust title="pipeline.rs:939-943"
+let branch_slug = if config.dry_run {
+    crate::git::slugify(task)
+} else {
+    generate_branch_slug(task, config.trace_dir.as_ref()).await
+};
+```
+
+The function uses Claude to generate a descriptive 3-6 word slug, with fallback to simple slugification:
+
+```rust
+const VERB_PREFIXES: &[&str] = &[
+    "add", "fix", "implement", "create", "build", "refactor",
+    "migrate", "integrate", "introduce", "design", "extract",
+    "replace", "rewrite", "optimize", "convert", "update",
+    "remove", "delete", "improve", "enable", "disable",
+    "configure", "setup", "upgrade", "downgrade",
+];
+
+pub fn ensure_multi_word_slug(slug: &str, task: &str) -> String {
+    // Single-word slugs are enriched with a verb prefix from the task
+    let word_count = slug.split('-').filter(|w| !w.is_empty()).count();
+    if word_count >= 2 {
+        return slug.to_string();
+    }
+
+    // Extract verb from task and prepend
+    let lower_task = task.to_lowercase();
+    let task_words: Vec<&str> = lower_task.split_whitespace().collect();
+    if let Some(first_word) = task_words.first() {
+        if VERB_PREFIXES.iter().any(|v| v == first_word) {
+            return format!("{}-{}", first_word, slug.to_lowercase());
+        }
+    }
+
+    crate::git::slugify(task)
+}
+```
+
+### 5. Create Git Branch
+
+With automatic collision handling:
+
+```rust title="pipeline.rs:944-958"
+let mut git = GitOps::new(&*sandbox, config.base_branch.clone());
+if let Err(e) = git.create_branch_from_slug(&branch_slug).await {
+    error!("git branch creation failed: {e:#}");
+    sandbox.destroy().await?;
+    return Ok(PipelineResult {
+        output: format!("Setup failed: could not create git branch: {e:#}"),
+        pr_url: None,
+        plane_issue_id,
+        ci_passed: false,
+        rounds_used: 0,
+        status: PipelineStatus::SetupFailed,
+    });
+}
+```
+
+<Note>
+If `magpie/{slug}` already exists, the pipeline appends `-2`, `-3`, etc. automatically.
+</Note>
+
+### 6. Classify Task Complexity
+
+Determines which blueprint to run:
+
+```rust title="pipeline.rs:960-963"
+progress(platform, channel_id, "Analyzing task...").await;
+let complexity = classify_task(task, config.dry_run, config.trace_dir.as_ref()).await;
+info!(?complexity, "task classified");
+```
+
+See [Task Classification](/concepts/task-classification) for details on how this works.
+
+### 7. Execute Blueprint
+
+Runs the appropriate blueprint based on complexity:
+
+```rust title="pipeline.rs:973-1055"
+match complexity {
+    TaskComplexity::Standard => {
+        progress(platform, channel_id, "Planning approach...").await;
+        let (bp, ctx) = build_tdd_blueprint(&trigger, config, &working_dir)?;
+        match BlueprintRunner::new(ctx, &*sandbox).run(&bp).await {
+            Ok(ctx) => {
+                last_output = ctx.last_output.clone().unwrap_or_default();
+                tdd_tests_passed = ctx.last_exit_code == Some(0);
+            }
+            Err(e) => {
+                return Ok(PipelineResult {
+                    output: format!("Agent failed in TDD pipeline: {e}"),
+                    status: PipelineStatus::AgentFailed,
+                    // ...
+                });
+            }
+        }
+    }
+    TaskComplexity::BugFix => {
+        progress(platform, channel_id, "Investigating bug...").await;
+        let (bp, ctx) = build_diagnostic_blueprint(&trigger, config, &working_dir)?;
+        // ... similar execution
+    }
+    TaskComplexity::Simple => {
+        progress(platform, channel_id, "Working on it...").await;
+        let (bp, ctx) = build_main_blueprint(&trigger, config, &working_dir)?;
+        // ... similar execution
+    }
+}
+```
+
+### 8. Classify Changes
+
+Determine if CI is needed:
+
+```rust title="pipeline.rs:1057-1073"
+let changed = git.changed_files().await.unwrap_or_default();
+let run_ci = if changed.is_empty() {
+    info!("no files changed — skipping CI");
+    false
+} else {
+    let needs = needs_ci(&changed);
+    if needs {
+        info!(file_count = changed.len(), "code changes detected → running CI");
+    } else {
+        info!(file_count = changed.len(), files = ?changed, "docs-only changes → skipping CI");
+    }
+    needs
+};
+```
+
+<Info>
+Docs-only extensions: `.md`, `.txt`, `.rst`, `.png`, `.jpg`, `.json`, `.yml`, `LICENSE`, `CHANGELOG`, etc.
+If **all** changed files are docs-only → skip CI.
+</Info>
+
+### 9. CI Loop
+
+Lint + test with automatic retries:
+
+```rust title="pipeline.rs:1075-1155"
+if run_ci {
+    for round in 1..=config.max_ci_rounds {
+        rounds_used = round;
+        info!(round, "CI round");
+
+        if round > 1 {
+            // Fix round: agent gets test failure output
+            let (bp, ctx) = build_fix_blueprint(&trigger, config, &last_test_output, &working_dir)?;
+            BlueprintRunner::new(ctx, &*sandbox).run(&bp).await?;
+        }
+
+        // Run lint + test
+        let ci_bp = Blueprint::new("magpie-ci")
+            .add_step(Step {
+                name: "lint-check".to_string(),
+                kind: StepKind::Shell(ShellStep::new(lint_cmd).with_args(lint_args)),
+                condition: Condition::Always,
+                continue_on_error: true,
+            })
+            .add_step(Step {
+                name: "test".to_string(),
+                kind: StepKind::Shell(ShellStep::new(test_cmd).with_args(test_args)),
+                condition: Condition::Always,
+                continue_on_error: true,
+            });
+
+        match BlueprintRunner::new(ci_ctx, &*sandbox).run(&ci_bp).await {
+            Ok(ctx) => {
+                if ctx.last_exit_code == Some(0) {
+                    ci_passed = true;
+                    info!(round, "tests passed");
+                    break;
+                } else {
+                    warn!(round, "tests failed");
+                }
+            }
+            Err(e) => warn!(round, error = %e, "CI blueprint error"),
+        }
+    }
+}
+```
+
+<Note>
+For Standard/BugFix tasks, if the blueprint's built-in test+lint steps already passed, the CI loop is skipped entirely.
+</Note>
+
+### 10. Generate Commit Message
+
+Another Tier 1 Claude call:
+
+```rust title="pipeline.rs:1163-1180"
+progress(platform, channel_id, "Creating pull request...").await;
+let pr_url = if config.dry_run {
+    None
+} else {
+    let diff = git.diff_content().await?;
+    if diff.trim().is_empty() {
+        None
+    } else {
+        let commit_message = generate_commit_message(
+            task,
+            &diff,
+            config.trace_dir.as_ref()
+        ).await?;
+        info!(commit_msg = %commit_message, "agent-generated commit message");
+        commit_push_pr(&git, task, &changed, ci_passed, &commit_message).await?
+    }
+};
+```
+
+Claude generates a conventional-commit message from the diff:
+
+```
+feat: add OAuth2 PKCE flow to auth module
+fix: resolve race condition in connection pool
+refactor: extract user validation into separate module
+```
+
+### 11. Update Plane Issue
+
+```rust title="pipeline.rs:1193-1211"
+if let (Some(issue_id), Some(plane_cfg)) = (&plane_issue_id, &config.plane) {
+    if let Ok(client) = PlaneClient::new(plane_cfg.clone()) {
+        let state = if ci_passed { "done" } else { "in_progress" };
+        let _ = client
+            .update_issue(
+                issue_id,
+                &IssueUpdate {
+                    state: Some(state.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        if let Some(url) = &pr_url {
+            let comment = format!("<p>PR created: <a href=\"{url}\">{url}</a></p>");
+            let _ = client.add_comment(issue_id, &comment).await;
+        }
+    }
+}
+```
+
+### 12. Cleanup
+
+Checkout base branch and destroy sandbox:
+
+```rust title="pipeline.rs:1213-1221"
+// Switch back to base branch so repo is clean for next run
+if let Err(e) = git.checkout_base().await {
+    warn!("failed to checkout base branch: {e}");
+}
+
+// Destroy sandbox (clean up temp resources)
+if let Err(e) = sandbox.destroy().await {
+    warn!("failed to destroy sandbox: {e}");
+}
+```
+
+### 13. Return Result
+
+```rust title="pipeline.rs:1223-1239"
+let status = if ci_passed {
+    PipelineStatus::Success
+} else if pr_url.is_some() {
+    PipelineStatus::PartialSuccess
+} else {
+    PipelineStatus::AgentFailed
+};
+
+Ok(PipelineResult {
+    output: last_output,
+    pr_url,
+    plane_issue_id,
+    ci_passed,
+    rounds_used,
+    status,
+})
+```
+
+## Error Handling
+
+<AccordionGroup>
+  <Accordion title="SetupFailed">
+    Pre-flight checks failed: repo resolution, branch creation, Plane issue creation, or sandbox setup.
+  </Accordion>
+  
+  <Accordion title="AgentFailed">
+    Agent execution failed during blueprint run. Sandbox is cleaned up, no PR is created.
+  </Accordion>
+  
+  <Accordion title="PartialSuccess">
+    Agent completed successfully and opened a PR, but CI tests failed. The PR exists with known issues.
+  </Accordion>
+  
+  <Accordion title="Success">
+    Agent completed and CI passed. PR is ready to merge.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Blueprints" icon="diagram-project" href="/concepts/blueprints">
+    Learn how blueprints orchestrate TDD and diagnostic flows
+  </Card>
+  <Card title="Task Classification" icon="tags" href="/concepts/task-classification">
+    Understand how tasks are classified into Simple, Standard, and BugFix
+  </Card>
+</CardGroup>

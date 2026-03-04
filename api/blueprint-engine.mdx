@@ -1,0 +1,617 @@
+---
+title: Blueprint Engine
+description: Deterministic orchestration of shell commands and AI agent steps
+---
+
+## Overview
+
+The blueprint engine provides deterministic orchestration of `Shell` and `Agent` steps with conditional execution, error handling, and context flow between steps.
+
+**Key Concepts:**
+
+- **Blueprint**: Named sequence of steps
+- **Step**: Single unit of work (Shell or Agent)
+- **StepContext**: State passed between steps (working dir, last output, exit code, metadata)
+- **Condition**: Predicate evaluated before running a step
+- **BlueprintRunner**: Executes blueprints step-by-step
+
+## Core Types
+
+### `Blueprint`
+
+A named sequence of steps.
+
+```rust
+pub struct Blueprint {
+    pub name: String,
+    pub steps: Vec<Step>,
+}
+```
+
+#### Methods
+
+##### `new()`
+
+Creates a new empty blueprint.
+
+```rust
+pub fn new(name: impl Into<String>) -> Self
+```
+
+<ParamField path="name" type="impl Into<String>" required>
+  Blueprint name for logging (e.g. "magpie-tdd", "demo-blueprint")
+</ParamField>
+
+##### `add_step()`
+
+Adds a step to the blueprint (builder pattern).
+
+```rust
+pub fn add_step(mut self, step: Step) -> Self
+```
+
+<ParamField path="step" type="Step" required>
+  Step to append to the sequence
+</ParamField>
+
+<ResponseField name="Self" type="Blueprint">
+  Returns self for chaining
+</ResponseField>
+
+**Example:**
+
+```rust
+use magpie_core::{Blueprint, Step, StepKind, ShellStep, Condition};
+
+let bp = Blueprint::new("my-workflow")
+    .add_step(Step {
+        name: "list-files".to_string(),
+        kind: StepKind::Shell(ShellStep::new("ls").with_args(vec!["-la".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: false,
+    })
+    .add_step(Step {
+        name: "check-cargo".to_string(),
+        kind: StepKind::Shell(ShellStep::new("cargo").with_args(vec!["check".to_string()])),
+        condition: Condition::IfExitCode(0),
+        continue_on_error: false,
+    });
+```
+
+### `Step`
+
+A single step in a blueprint.
+
+```rust
+pub struct Step {
+    pub name: String,
+    pub kind: StepKind,
+    pub condition: Condition,
+    pub continue_on_error: bool,
+}
+```
+
+<ParamField path="name" type="String" required>
+  Step name for logging (e.g. "scan-repo", "run-tests")
+</ParamField>
+
+<ParamField path="kind" type="StepKind" required>
+  What the step does: `Shell` or `Agent`
+</ParamField>
+
+<ParamField path="condition" type="Condition" required>
+  When to run this step (e.g. `Always`, `IfExitCode(0)`)
+</ParamField>
+
+<ParamField path="continue_on_error" type="bool" required>
+  If true, pipeline continues even if this step fails. If false, pipeline stops on error.
+</ParamField>
+
+### `StepKind`
+
+What kind of work a step performs.
+
+```rust
+pub enum StepKind {
+    Shell(ShellStep),
+    Agent(AgentStep),
+}
+```
+
+- **Shell**: Runs a deterministic shell command
+- **Agent**: Runs an AI agent with tool access
+
+### `StepContext`
+
+State passed between blueprint steps.
+
+```rust
+pub struct StepContext {
+    pub working_dir: PathBuf,
+    pub last_output: Option<String>,
+    pub last_exit_code: Option<i32>,
+    pub metadata: HashMap<String, String>,
+}
+```
+
+<ParamField path="working_dir" type="PathBuf" required>
+  Working directory for shell commands and agent tools
+</ParamField>
+
+<ParamField path="last_output" type="Option<String>">
+  Combined stdout + stderr from the previous step
+</ParamField>
+
+<ParamField path="last_exit_code" type="Option<i32>">
+  Exit code from the previous step (0 = success)
+</ParamField>
+
+<ParamField path="metadata" type="HashMap<String, String>">
+  Key-value store for passing data between steps (e.g. chat_history, trace_dir)
+</ParamField>
+
+#### Methods
+
+##### `new()`
+
+Creates a new context with empty state.
+
+```rust
+pub fn new(working_dir: PathBuf) -> Self
+```
+
+**Example:**
+
+```rust
+use magpie_core::StepContext;
+use std::path::PathBuf;
+
+let mut ctx = StepContext::new(PathBuf::from("/workspace"));
+ctx.metadata.insert("chat_history".to_string(), "...".to_string());
+```
+
+### `Condition`
+
+Condition evaluated by the engine before running a step.
+
+```rust
+pub enum Condition {
+    Always,
+    IfExitCode(i32),
+    IfExitCodeNot(i32),
+    IfOutputContains(String),
+}
+```
+
+- **Always**: Step always runs
+- **IfExitCode(code)**: Step runs only if previous exit code matches
+- **IfExitCodeNot(code)**: Step runs only if previous exit code doesn't match
+- **IfOutputContains(needle)**: Step runs only if previous output contains the string
+
+#### Methods
+
+##### `evaluate()`
+
+Evaluates the condition against current context.
+
+```rust
+pub fn evaluate(&self, ctx: &StepContext) -> bool
+```
+
+**Example:**
+
+```rust
+use magpie_core::{Condition, StepContext};
+use std::path::PathBuf;
+
+let mut ctx = StepContext::new(PathBuf::from("/workspace"));
+ctx.last_exit_code = Some(0);
+
+assert!(Condition::Always.evaluate(&ctx));
+assert!(Condition::IfExitCode(0).evaluate(&ctx));
+assert!(!Condition::IfExitCode(1).evaluate(&ctx));
+```
+
+## BlueprintRunner
+
+Runs a blueprint step-by-step, managing context flow and conditions.
+
+```rust
+pub struct BlueprintRunner<'a> {
+    context: StepContext,
+    sandbox: &'a dyn Sandbox,
+}
+```
+
+### Methods
+
+#### `new()`
+
+Creates a new runner with initial context.
+
+```rust
+pub fn new(context: StepContext, sandbox: &'a dyn Sandbox) -> Self
+```
+
+<ParamField path="context" type="StepContext" required>
+  Initial context (working_dir, metadata)
+</ParamField>
+
+<ParamField path="sandbox" type="&'a dyn Sandbox" required>
+  Sandbox for executing commands (local or remote)
+</ParamField>
+
+#### `run()`
+
+Executes the blueprint and returns the final context.
+
+```rust
+pub async fn run(mut self, blueprint: &Blueprint) -> Result<StepContext>
+```
+
+<ParamField path="blueprint" type="&Blueprint" required>
+  Blueprint to execute
+</ParamField>
+
+<ResponseField name="Result<StepContext>" type="StepContext">
+  Returns final context with last_output and last_exit_code from the final step
+</ResponseField>
+
+**Execution Flow:**
+
+1. For each step in sequence:
+   - Evaluate condition against current context
+   - If condition fails, skip step
+   - If condition passes, execute step
+   - On success, update context with new output/exit code
+   - On error:
+     - If `continue_on_error: true`, log warning and continue
+     - If `continue_on_error: false`, return error immediately
+2. Return final context
+
+**Example:**
+
+```rust
+use magpie_core::{
+    Blueprint, BlueprintRunner, Step, StepKind, ShellStep, AgentStep,
+    Condition, StepContext, LocalSandbox,
+};
+use std::path::PathBuf;
+
+let bp = Blueprint::new("demo")
+    .add_step(Step {
+        name: "list-files".to_string(),
+        kind: StepKind::Shell(ShellStep::new("ls").with_args(vec!["-la".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: false,
+    })
+    .add_step(Step {
+        name: "summarize".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new("Summarize the file listing")
+                .with_last_output()
+        ),
+        condition: Condition::IfExitCode(0),
+        continue_on_error: false,
+    });
+
+let working_dir = PathBuf::from("/workspace");
+let sandbox = LocalSandbox::from_path(working_dir.clone());
+let runner = BlueprintRunner::new(StepContext::new(working_dir), &sandbox);
+
+let ctx = runner.run(&bp).await?;
+println!("Final output: {:?}", ctx.last_output);
+```
+
+## Step Types
+
+### ShellStep
+
+A deterministic shell step — runs a command and captures output + exit code.
+
+```rust
+pub struct ShellStep {
+    pub command: String,
+    pub args: Vec<String>,
+}
+```
+
+#### Methods
+
+##### `new()`
+
+Creates a new shell step.
+
+```rust
+pub fn new(command: impl Into<String>) -> Self
+```
+
+<ParamField path="command" type="impl Into<String>" required>
+  Command to execute (e.g. "ls", "cargo", "git")
+</ParamField>
+
+##### `with_args()`
+
+Sets command arguments (builder pattern).
+
+```rust
+pub fn with_args(mut self, args: Vec<String>) -> Self
+```
+
+<ParamField path="args" type="Vec<String>" required>
+  Command arguments
+</ParamField>
+
+##### `execute()`
+
+Executes the command via sandbox.
+
+```rust
+pub async fn execute(&self, ctx: &StepContext, sandbox: &dyn Sandbox) -> Result<StepContext>
+```
+
+**Behavior:**
+
+- Executes command via `sandbox.exec()`
+- Combines stdout + stderr into `last_output`
+- Sets `last_exit_code`
+- Returns updated context
+
+**Example:**
+
+```rust
+use magpie_core::{ShellStep, StepContext, LocalSandbox};
+use std::path::PathBuf;
+
+let step = ShellStep::new("echo").with_args(vec!["hello".to_string()]);
+let ctx = StepContext::new(PathBuf::from("/tmp"));
+let sandbox = LocalSandbox::from_path(PathBuf::from("/tmp"));
+
+let result = step.execute(&ctx, &sandbox).await?;
+assert_eq!(result.last_exit_code, Some(0));
+assert!(result.last_output.unwrap().contains("hello"));
+```
+
+### AgentStep
+
+An agentic step — runs MagpieAgent with a prompt, optionally injecting prior output.
+
+```rust
+pub struct AgentStep {
+    pub prompt: String,
+    pub max_turns: Option<u32>,
+    pub include_last_output: bool,
+    pub context_metadata_key: Option<String>,
+    pub step_name: Option<String>,
+}
+```
+
+#### Methods
+
+##### `new()`
+
+Creates a new agent step.
+
+```rust
+pub fn new(prompt: impl Into<String>) -> Self
+```
+
+<ParamField path="prompt" type="impl Into<String>" required>
+  Natural language prompt for the agent
+</ParamField>
+
+##### `with_max_turns()`
+
+Sets custom max turns (builder pattern).
+
+```rust
+pub fn with_max_turns(mut self, turns: u32) -> Self
+```
+
+<ParamField path="turns" type="u32" required>
+  Maximum conversation turns
+</ParamField>
+
+##### `with_last_output()`
+
+Injects previous step's output into the prompt (builder pattern).
+
+```rust
+pub fn with_last_output(mut self) -> Self
+```
+
+Prepends previous step output to the prompt:
+
+```
+Previous step output:
+```
+last_output
+```
+
+Original prompt:
+```
+
+##### `with_context_from_metadata()`
+
+Injects a metadata value into the prompt (builder pattern).
+
+```rust
+pub fn with_context_from_metadata(mut self, key: impl Into<String>) -> Self
+```
+
+<ParamField path="key" type="impl Into<String>" required>
+  Metadata key to inject (e.g. "chat_history", "trace_dir")
+</ParamField>
+
+Prepends metadata value to the prompt:
+
+```
+Context from conversation:
+```
+metadata_value
+```
+
+Original prompt:
+```
+
+##### `execute()`
+
+Executes the agent step.
+
+```rust
+pub async fn execute(
+    &self,
+    ctx: &StepContext,
+    step_name: &str,
+    sandbox: &dyn Sandbox,
+) -> Result<StepContext>
+```
+
+**Behavior:**
+
+- For **local sandboxes**: Uses `MagpieAgent` with full Goose agent loop
+- For **Daytona sandboxes**: Execs `claude -p` inside the sandbox remotely
+- Injects `context_metadata_key` if set
+- Injects `last_output` if `include_last_output: true`
+- Sets `last_output` to agent response
+- Sets `last_exit_code` to 0 (agents don't have exit codes)
+- Returns updated context
+
+**Example:**
+
+```rust
+use magpie_core::{AgentStep, StepContext, LocalSandbox};
+use std::path::PathBuf;
+
+let step = AgentStep::new("Add a health check endpoint")
+    .with_max_turns(10)
+    .with_context_from_metadata("chat_history");
+
+let mut ctx = StepContext::new(PathBuf::from("/workspace"));
+ctx.metadata.insert("chat_history".to_string(), "Previous messages...".to_string());
+
+let sandbox = LocalSandbox::from_path(PathBuf::from("/workspace"));
+let result = step.execute(&ctx, "implement", &sandbox).await?;
+
+println!("Agent response: {}", result.last_output.unwrap());
+```
+
+## Complete Example
+
+```rust
+use magpie_core::{
+    Blueprint, BlueprintRunner, Step, StepKind, ShellStep, AgentStep,
+    Condition, StepContext, LocalSandbox,
+};
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let working_dir = PathBuf::from("/workspace/my-repo");
+
+    // Build a TDD-style blueprint
+    let bp = Blueprint::new("mini-tdd")
+        // Step 1: Scan repo
+        .add_step(Step {
+            name: "scan-repo".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("find")
+                    .with_args(vec![
+                        ".".to_string(),
+                        "-type".to_string(),
+                        "f".to_string(),
+                        "-name".to_string(),
+                        "*.rs".to_string(),
+                    ])
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        })
+        // Step 2: Write tests
+        .add_step(Step {
+            name: "write-tests".to_string(),
+            kind: StepKind::Agent(
+                AgentStep::new("Write unit tests for the main module")
+                    .with_last_output()
+                    .with_max_turns(10)
+            ),
+            condition: Condition::IfExitCode(0),
+            continue_on_error: false,
+        })
+        // Step 3: Run tests (expect failure)
+        .add_step(Step {
+            name: "run-tests".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("cargo").with_args(vec!["test".to_string()])
+            ),
+            condition: Condition::Always,
+            continue_on_error: true, // TDD: tests should fail
+        })
+        // Step 4: Implement
+        .add_step(Step {
+            name: "implement".to_string(),
+            kind: StepKind::Agent(
+                AgentStep::new("Implement the code to make tests pass")
+                    .with_last_output()
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        })
+        // Step 5: Run tests again (expect success)
+        .add_step(Step {
+            name: "verify".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("cargo").with_args(vec!["test".to_string()])
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        });
+
+    // Execute blueprint
+    let sandbox = LocalSandbox::from_path(working_dir.clone());
+    let runner = BlueprintRunner::new(StepContext::new(working_dir), &sandbox);
+
+    let ctx = runner.run(&bp).await?;
+
+    println!("Blueprint completed!");
+    println!("Final exit code: {:?}", ctx.last_exit_code);
+    println!("Final output: {:?}", ctx.last_output);
+
+    Ok(())
+}
+```
+
+## Error Handling
+
+The runner stops execution when a step fails, unless `continue_on_error: true`.
+
+**Example:**
+
+```rust
+let bp = Blueprint::new("fault-tolerant")
+    .add_step(Step {
+        name: "might-fail".to_string(),
+        kind: StepKind::Shell(ShellStep::new("false")),
+        condition: Condition::Always,
+        continue_on_error: true, // Pipeline continues even if this fails
+    })
+    .add_step(Step {
+        name: "always-runs".to_string(),
+        kind: StepKind::Shell(ShellStep::new("echo").with_args(vec!["recovered".to_string()])),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+let ctx = runner.run(&bp).await?;
+assert!(ctx.last_output.unwrap().contains("recovered"));
+```
+
+## Built-in Blueprints
+
+Magpie includes three built-in blueprints in `pipeline.rs`:
+
+- **Simple** (`build_main_blueprint`): Single agent call for docs/typos
+- **TDD** (`build_tdd_blueprint`): 7-step TDD flow for features
+- **Diagnostic** (`build_diagnostic_blueprint`): 8-step investigation flow for bugs
+
+See [Pipeline API](/api/pipeline#blueprint-builders) for details.

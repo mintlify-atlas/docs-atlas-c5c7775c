@@ -1,0 +1,165 @@
+---
+title: ChatPlatform
+description: The contract every chat plugin implements for integrating with messaging platforms.
+---
+
+## Overview
+
+The `ChatPlatform` trait defines the interface for all chat platform adapters in Magpie. Every messaging platform integration (Discord, Teams, Slack, etc.) implements this trait to provide a consistent API for fetching conversation history, sending messages, and managing threads.
+
+## Trait Definition
+
+```rust
+use anyhow::Result;
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait ChatPlatform: Send + Sync {
+    fn name(&self) -> &str;
+    async fn fetch_history(&self, channel_id: &str) -> Result<String>;
+    async fn send_message(&self, channel_id: &str, text: &str) -> Result<()>;
+    async fn close_thread(&self, _channel_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+```
+
+## Methods
+
+<ParamField path="name" type="fn(&self) -> &str" required>
+  Platform identifier (e.g., "discord", "teams", "slack").
+  
+  Returns a static string identifying the chat platform. Used for logging and debugging.
+</ParamField>
+
+<ParamField path="fetch_history" type="async fn(&self, channel_id: &str) -> Result<String>" required>
+  Fetch conversation history from a channel/thread, formatted as text.
+  
+  **Parameters:**
+  - `channel_id` - Platform-specific channel or thread identifier
+  
+  **Returns:**
+  - `Ok(String)` - Formatted conversation history as text
+  - `Err(_)` - If fetching history fails
+  
+  **Note:** Most implementations return an empty string since the trigger message is already passed as `task` in `run_pipeline()`. Dumping the last N channel messages often adds noise rather than useful context.
+</ParamField>
+
+<ParamField path="send_message" type="async fn(&self, channel_id: &str, text: &str) -> Result<()>" required>
+  Send a message to a channel/thread.
+  
+  **Parameters:**
+  - `channel_id` - Platform-specific channel or thread identifier
+  - `text` - Message content to send
+  
+  **Returns:**
+  - `Ok(())` - Message sent successfully
+  - `Err(_)` - If sending fails
+</ParamField>
+
+<ParamField path="close_thread" type="async fn(&self, channel_id: &str) -> Result<()>">
+  Close or archive a thread after the final response has been sent.
+  
+  **Parameters:**
+  - `channel_id` - Platform-specific channel or thread identifier
+  
+  **Returns:**
+  - `Ok(())` - Thread closed successfully (or no-op)
+  - `Err(_)` - If closing fails
+  
+  **Default Implementation:** No-op that returns `Ok(())`. Platforms that support thread archiving (e.g., Discord) override this.
+</ParamField>
+
+## Example Implementation
+
+Here's a complete implementation for Discord using the Serenity library:
+
+```rust
+use std::sync::Arc;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use serenity::all::ChannelId;
+use serenity::builder::EditThread;
+use serenity::http::Http;
+use magpie_core::ChatPlatform;
+
+pub struct DiscordPlatform {
+    http: Arc<Http>,
+}
+
+impl DiscordPlatform {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl ChatPlatform for DiscordPlatform {
+    fn name(&self) -> &str {
+        "discord"
+    }
+
+    async fn fetch_history(&self, _channel_id: &str) -> Result<String> {
+        // The trigger message is already passed as `task` in run_pipeline
+        Ok(String::new())
+    }
+
+    async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
+        let id: u64 = channel_id.parse()
+            .context("invalid discord channel ID")?;
+        let channel = ChannelId::new(id);
+
+        channel
+            .say(&self.http, text)
+            .await
+            .context("failed to send discord message")?;
+
+        Ok(())
+    }
+
+    async fn close_thread(&self, channel_id: &str) -> Result<()> {
+        let id: u64 = channel_id.parse()
+            .context("invalid discord channel ID")?;
+        let channel = ChannelId::new(id);
+
+        channel
+            .edit_thread(&self.http, EditThread::new().archived(true).locked(true))
+            .await
+            .context("failed to archive discord thread")?;
+
+        Ok(())
+    }
+}
+```
+
+## Usage in Pipeline
+
+The `ChatPlatform` trait is used throughout the pipeline to send status updates:
+
+```rust
+use magpie_core::{ChatPlatform, PipelineConfig, run_pipeline};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let platform: Box<dyn ChatPlatform> = Box::new(DiscordPlatform::new(http));
+    
+    let config = PipelineConfig {
+        repo_dir: "/path/to/repo".into(),
+        task: "fix login bug".to_string(),
+        platform: Some(platform),
+        channel_id: Some("123456789".to_string()),
+        // ... other config fields
+    };
+    
+    let result = run_pipeline(config).await?;
+    Ok(())
+}
+```
+
+## Design Notes
+
+- All trait methods use `async_trait` since chat platform APIs are typically async
+- The trait requires `Send + Sync` bounds for use across async task boundaries
+- Channel IDs are platform-specific strings (numeric IDs for Discord, complex identifiers for Teams)
+- Error handling uses `anyhow::Result` for flexibility
+- The default `close_thread` implementation makes thread archiving optional

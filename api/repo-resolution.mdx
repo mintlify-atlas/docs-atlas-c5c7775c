@@ -1,0 +1,317 @@
+---
+title: Repository Resolution
+description: Org-scoped dynamic repo resolution for multi-repository pipelines.
+---
+
+## Overview
+
+The repository resolution module provides functions for parsing repo names from task messages, validating they belong to an allowed GitHub org, and cloning them into temporary workspaces. This enables Magpie to work across multiple repositories in an organization.
+
+## Configuration
+
+### RepoConfig
+
+```rust
+#[derive(Debug, Clone)]
+pub struct RepoConfig {
+    /// The GitHub org all repos must belong to (e.g. "myorg").
+    pub github_org: String,
+}
+```
+
+<ParamField path="github_org" type="String" required>
+  The GitHub organization that all repositories must belong to.
+  
+  Used to validate that parsed repo names are within the allowed scope. Case-sensitive.
+</ParamField>
+
+### ResolvedRepo
+
+```rust
+pub struct ResolvedRepo {
+    /// Fully-qualified `org/repo` name (e.g. "myorg/api-service").
+    pub full_name: String,
+    /// Filesystem path to the cloned repo (inside the temp dir).
+    pub repo_dir: PathBuf,
+    /// The temp directory that owns the clone. Dropped → cleaned up.
+    _temp_dir: tempfile::TempDir,
+}
+```
+
+A resolved repository ready for pipeline use. The `ResolvedRepo` owns the temporary directory — when this value is dropped, the clone is automatically deleted.
+
+## Functions
+
+<ParamField path="parse_repo_from_message" type="fn(message: &str) -> Option<String>" required>
+  Parse the repo name from a task message.
+  
+  **Parameters:**
+  - `message` - The task message to parse
+  
+  **Returns:**
+  - `Some(String)` - Repo name (without org prefix)
+  - `None` - No recognizable repo pattern found
+  
+  **Recognized Patterns:**
+  - `"fix login bug in api-service"` → `Some("api-service")`
+  - `"fix bug repo api-service"` → `Some("api-service")`
+  - `"fix bug in myorg/api-service"` → `Some("api-service")` (strips org prefix)
+  
+  **Pattern Matching:**
+  1. **Pass 1:** Looks for `"repo <name>"` pattern
+  2. **Pass 2:** Looks for `"in <name>"` pattern (skips noise words)
+  
+  **Noise Words Ignored:**
+  `the`, `a`, `an`, `this`, `that`, `my`, `our`, `your`, `its`, `some`, `any`, `code`, `project`, `codebase`, `app`, `application`
+  
+  **Example:**
+  ```rust
+  use magpie_core::repo::parse_repo_from_message;
+  
+  let result = parse_repo_from_message("fix login bug in api-service");
+  assert_eq!(result, Some("api-service".to_string()));
+  
+  let result = parse_repo_from_message("deploy repo frontend-app");
+  assert_eq!(result, Some("frontend-app".to_string()));
+  
+  // Strips org prefix
+  let result = parse_repo_from_message("fix bug in myorg/api-service");
+  assert_eq!(result, Some("api-service".to_string()));
+  
+  // Ignores noise words
+  let result = parse_repo_from_message("fix the bug in the code");
+  assert_eq!(result, None);
+  ```
+</ParamField>
+
+<ParamField path="validate_org" type="fn(full_name: &str, org: &str) -> anyhow::Result<()>" required>
+  Validate that a repo belongs to the allowed org.
+  
+  **Parameters:**
+  - `full_name` - Fully-qualified repo name (e.g., `"myorg/api-service"`)
+  - `org` - Expected organization name
+  
+  **Returns:**
+  - `Ok(())` - Repo belongs to the org
+  - `Err(_)` - Repo doesn't belong to org or validation failed
+  
+  **Validation Rules:**
+  - Performs string-prefix check on `"{org}/"`
+  - Verifies repo part after slash is non-empty
+  - Case-sensitive match (though GitHub orgs are case-insensitive, this enforces config safety)
+  
+  **Example:**
+  ```rust
+  use magpie_core::repo::validate_org;
+  
+  // Valid
+  validate_org("myorg/api-service", "myorg").unwrap();
+  
+  // Wrong org
+  let result = validate_org("evil-org/api-service", "myorg");
+  assert!(result.is_err());
+  
+  // Missing org prefix
+  let result = validate_org("api-service", "myorg");
+  assert!(result.is_err());
+  
+  // Empty repo name
+  let result = validate_org("myorg/", "myorg");
+  assert!(result.is_err());
+  ```
+</ParamField>
+
+<ParamField path="clone_repo" type="fn(repo_name: &str, org: &str) -> anyhow::Result<ResolvedRepo>" required>
+  Clone `org/repo` into a temp directory using `gh repo clone`.
+  
+  **Parameters:**
+  - `repo_name` - Repository name (without org prefix)
+  - `org` - GitHub organization name
+  
+  **Returns:**
+  - `Ok(ResolvedRepo)` - Cloned repo with temp directory ownership
+  - `Err(_)` - If cloning fails (network error, repo doesn't exist, auth issues)
+  
+  **Requirements:**
+  - `gh` CLI must be installed and authenticated
+  - User must have access to the repository
+  
+  **Cleanup:**
+  The returned `ResolvedRepo` owns the temp directory. When dropped, the directory is automatically cleaned up.
+  
+  **Example:**
+  ```rust
+  use magpie_core::repo::clone_repo;
+  
+  let resolved = clone_repo("api-service", "myorg")?;
+  
+  assert_eq!(resolved.full_name, "myorg/api-service");
+  assert!(resolved.repo_dir.exists());
+  assert!(resolved.repo_dir.join(".git").exists());
+  
+  // Use the cloned repo
+  let config_path = resolved.repo_dir.join("config.toml");
+  let config = std::fs::read_to_string(config_path)?;
+  
+  // Automatic cleanup when resolved is dropped
+  drop(resolved);
+  ```
+</ParamField>
+
+## Complete Example
+
+```rust
+use magpie_core::repo::{parse_repo_from_message, validate_org, clone_repo};
+use anyhow::Result;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let task = "fix login bug in api-service";
+    let allowed_org = "myorg";
+    
+    // Parse repo name from task
+    let repo_name = parse_repo_from_message(task)
+        .ok_or_else(|| anyhow::anyhow!("No repo found in task message"))?;
+    
+    println!("Parsed repo: {}", repo_name);
+    
+    // Validate org
+    let full_name = format!("{}/{}", allowed_org, repo_name);
+    validate_org(&full_name, allowed_org)?;
+    
+    println!("Validated: {}", full_name);
+    
+    // Clone repo
+    let resolved = clone_repo(&repo_name, allowed_org)?;
+    
+    println!("Cloned to: {:?}", resolved.repo_dir);
+    println!("Full name: {}", resolved.full_name);
+    
+    // Use the repo
+    let readme_path = resolved.repo_dir.join("README.md");
+    if readme_path.exists() {
+        let readme = std::fs::read_to_string(readme_path)?;
+        println!("README preview: {}", readme.lines().take(3).collect::<Vec<_>>().join("\n"));
+    }
+    
+    // Temp directory is cleaned up when resolved is dropped
+    Ok(())
+}
+```
+
+## Pattern Matching Details
+
+### Valid Repo Names
+
+A valid repo name must:
+- Be at least 1 character long
+- Start with an alphanumeric character
+- Contain only alphanumeric characters, hyphens, underscores, or dots
+
+```rust
+// Valid repo names
+"api-service"       // hyphenated
+"auth_service"      // underscored
+"my.service"        // dotted
+"service123"        // with numbers
+"my-cool-service"   // multiple hyphens
+
+// Invalid repo names
+"-service"           // starts with hyphen
+"the"               // noise word
+""                  // empty
+```
+
+### Message Parsing Examples
+
+```rust
+use magpie_core::repo::parse_repo_from_message;
+
+// "in <repo>" pattern
+assert_eq!(
+    parse_repo_from_message("fix login bug in api-service"),
+    Some("api-service".to_string())
+);
+
+// "repo <repo>" pattern
+assert_eq!(
+    parse_repo_from_message("fix bug repo api-service"),
+    Some("api-service".to_string())
+);
+
+// With org prefix (strips org)
+assert_eq!(
+    parse_repo_from_message("fix bug in myorg/api-service"),
+    Some("api-service".to_string())
+);
+
+// Noise words ignored
+assert_eq!(
+    parse_repo_from_message("fix the bug in the code"),
+    None
+);
+
+// No pattern match
+assert_eq!(
+    parse_repo_from_message("fix the login bug"),
+    None
+);
+```
+
+## Usage in Pipeline
+
+The repo resolution functions are used during pipeline setup:
+
+```rust
+use magpie_core::repo::{parse_repo_from_message, validate_org, clone_repo, RepoConfig};
+use magpie_core::{PipelineConfig, run_pipeline};
+
+let config = RepoConfig {
+    github_org: "myorg".to_string(),
+};
+
+let task = "fix login bug in api-service";
+
+// Parse and validate repo
+if let Some(repo_name) = parse_repo_from_message(task) {
+    let full_name = format!("{}/{}", config.github_org, repo_name);
+    validate_org(&full_name, &config.github_org)?;
+    
+    // Clone repo
+    let resolved = clone_repo(&repo_name, &config.github_org)?;
+    
+    // Run pipeline with cloned repo
+    let pipeline_config = PipelineConfig {
+        repo_dir: resolved.repo_dir.clone(),
+        task: task.to_string(),
+        // ... other config
+    };
+    
+    let result = run_pipeline(pipeline_config).await?;
+}
+```
+
+## Security Considerations
+
+- **Org Validation:** Always validate the org before cloning to prevent access to unauthorized repositories
+- **Case Sensitivity:** Org matching is case-sensitive by design for config safety
+- **Temp Directory Cleanup:** `ResolvedRepo` automatically cleans up temp directories on drop to prevent disk space leaks
+- **Auth Required:** `gh repo clone` requires GitHub CLI authentication
+
+## Error Cases
+
+```rust
+use magpie_core::repo::clone_repo;
+
+// Non-existent repo
+let result = clone_repo("this-repo-does-not-exist", "myorg");
+assert!(result.is_err());
+
+// Network error
+let result = clone_repo("api-service", "myorg");
+// May fail if offline or rate-limited
+
+// Auth error
+let result = clone_repo("private-repo", "myorg");
+// Fails if gh CLI not authenticated or no access
+```

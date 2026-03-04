@@ -1,0 +1,178 @@
+---
+title: 'Simple Task: Docs/Typo Fix'
+description: 'Example of a simple documentation fix flowing through the Simple blueprint'
+icon: 'pencil'
+---
+
+## Overview
+
+Simple tasks like documentation updates, typo fixes, and formatting changes go through Magpie's fast **Simple blueprint** (`magpie-main`). This is a single-shot agent call that skips the multi-step TDD or diagnostic flows.
+
+## Task Classification
+
+Magpie classifies tasks using keyword matching. The following keywords trigger the Simple path:
+
+- `fix typo`, `update readme`, `fix docs`, `update docs`
+- `update changelog`, `rename`, `fix comment`, `fix spelling`
+- `fix whitespace`, `fix formatting`, `update license`
+
+For ambiguous cases, Magpie uses a Tier 1 Claude call to classify the task.
+
+## Example: Fix README Typo
+
+### Discord Message
+
+```
+@magpie fix typo in README.md — "recieve" should be "receive"
+```
+
+### Pipeline Flow
+
+<Steps>
+  <Step title="Task Classification">
+    Magpie detects the keyword `"fix typo"` and immediately classifies this as **Simple**.
+    
+    ```
+    [INFO] task="fix typo in README.md" classified as Simple (keyword match)
+    ```
+  </Step>
+
+  <Step title="Branch Creation">
+    Tier 1 Claude generates a descriptive branch slug:
+    
+    ```bash
+    # Tier 1 call: generate_branch_slug
+    claude -p "Generate a 3-6 word git branch slug for this task..."
+    # Output: fix-readme-typo
+    
+    git checkout -b magpie/fix-readme-typo
+    ```
+  </Step>
+
+  <Step title="Simple Blueprint Execution">
+    The `magpie-main` blueprint runs two steps:
+    
+    1. **validate-workspace** (shell): `pwd` confirms working directory
+    2. **execute-task** (agent): Single-shot Goose agent call
+    
+    ```
+    Blueprint: magpie-main
+    Step 1/2: validate-workspace [shell] → pwd
+    Step 2/2: execute-task [agent] → Goose (claude-code provider)
+    ```
+    
+    Agent prompt includes:
+    - Task: `fix typo in README.md — "recieve" should be "receive"`
+    - Chat history: Full Discord thread context
+    - Working directory: `/workspace/magpie`
+  </Step>
+
+  <Step title="Agent Execution">
+    The agent makes a single file edit:
+    
+    ```diff
+    --- a/README.md
+    +++ b/README.md
+    @@ -3,7 +3,7 @@
+     
+     Autonomous AI coding pipeline inspired by Stripe's Minions. 
+     Written in Rust, powered by Goose as a library crate.
+     
+    -Chat triggers the work. Magpie does the rest. A message in a thread kicks off an end-to-end pipeline: read context, create a tracking issue, spin up a sandbox, classify the task, run the right agent blueprint, lint, test, open a PR, and reply with the result.
+    +Chat triggers the work. Magpie does the rest. A message in a thread kicks off an end-to-end pipeline: read context, create a tracking issue, spin up a sandbox, classify the task, run the right agent blueprint, lint, test, open a PR, and reply with the result.
+    
+    ## Pipeline
+    ```
+    
+    Agent output:
+    ```
+    Fixed typo in README.md: changed "recieve" to "receive" on line 6.
+    ```
+  </Step>
+
+  <Step title="CI Classification">
+    Magpie checks if the changed files are docs-only:
+    
+    ```
+    [INFO] file_count=1 files=["README.md"] docs-only changes → skipping CI
+    ```
+    
+    `.md` files are classified as docs-only, so lint and test steps are skipped entirely.
+  </Step>
+
+  <Step title="Commit Message Generation">
+    Tier 1 Claude generates a conventional commit message from the diff:
+    
+    ```bash
+    claude -p "Generate a conventional commit message from this diff..."
+    # Output: docs: fix typo in README (recieve → receive)
+    ```
+  </Step>
+
+  <Step title="PR Creation">
+    ```bash
+    git add README.md
+    git commit -m "docs: fix typo in README (recieve → receive)"
+    git push -u origin magpie/fix-readme-typo
+    gh pr create --title "Fix typo in README.md" \
+      --body "Fixes typo: recieve → receive"
+    ```
+    
+    PR URL: `https://github.com/org/repo/pull/142`
+  </Step>
+
+  <Step title="Plane Issue Update">
+    If Plane integration is configured:
+    
+    ```
+    [INFO] issue_id="MAGPIE-42" updating Plane issue
+    State: done
+    Comment: PR created: https://github.com/org/repo/pull/142
+    ```
+  </Step>
+</Steps>
+
+## Pipeline Result
+
+```json
+{
+  "output": "Fixed typo in README.md: changed 'recieve' to 'receive' on line 6.",
+  "pr_url": "https://github.com/org/repo/pull/142",
+  "plane_issue_id": "MAGPIE-42",
+  "ci_passed": true,
+  "rounds_used": 1,
+  "status": "Success"
+}
+```
+
+## Discord Bot Reply
+
+```
+✅ Done!
+
+PR: https://github.com/org/repo/pull/142
+Branch: magpie/fix-readme-typo
+CI: Skipped (docs-only)
+Plane: MAGPIE-42
+```
+
+The Discord thread is automatically archived and locked.
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Total time | ~2 minutes |
+| Agent turns | 1 (single-shot) |
+| CI rounds | 0 (docs-only) |
+| Tier 1 calls | 2 (branch slug, commit message) |
+| Tier 2 calls | 1 (agent execution) |
+
+## Why Simple is Fast
+
+1. **Keyword-based classification** — no LLM call needed
+2. **Single-shot agent** — no TDD/diagnostic phases
+3. **Docs-only detection** — skips lint and test entirely
+4. **No CI retries** — one round, done
+
+Simple tasks complete in ~2 minutes compared to ~15-20 minutes for Standard/BugFix tasks.

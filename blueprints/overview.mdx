@@ -1,0 +1,305 @@
+---
+title: Blueprint Engine Overview
+description: Learn how Magpie's deterministic blueprint engine orchestrates AI agent workflows
+icon: diagram-project
+---
+
+## What is the Blueprint Engine?
+
+Magpie's blueprint engine is a **deterministic orchestration layer** that coordinates AI agent steps, shell commands, and conditional logic into reproducible workflows. Unlike pure agentic systems where behavior can vary, blueprints provide structure and predictability.
+
+<Note>
+The blueprint engine is the **glue** between simple shell scripts (too rigid) and pure AI agents (too unpredictable). It gives you the best of both worlds: deterministic control flow with intelligent agent execution.
+</Note>
+
+## Core Architecture
+
+The blueprint system consists of four main components:
+
+```mermaid
+graph TD
+    A[Blueprint] -->|contains| B[Step[]]
+    B -->|has| C[StepKind]
+    B -->|has| D[Condition]
+    C -->|executes via| E[BlueprintRunner]
+    E -->|flows| F[StepContext]
+    F -->|updates| E
+```
+
+### 1. Blueprint
+
+A **named sequence of steps** that defines a complete workflow.
+
+```rust
+pub struct Blueprint {
+    pub name: String,
+    pub steps: Vec<Step>,
+}
+```
+
+From `crates/magpie-core/src/blueprint/runner.rs:8-12`
+
+**Key methods:**
+- `Blueprint::new(name)` — Create a new blueprint
+- `.add_step(step)` — Chain steps fluently
+
+### 2. Step
+
+A **single unit of work** with a name, kind, condition, and error handling.
+
+```rust
+pub struct Step {
+    pub name: String,
+    pub kind: StepKind,
+    pub condition: Condition,
+    pub continue_on_error: bool,
+}
+```
+
+From `crates/magpie-core/src/blueprint/step.rs:56-62`
+
+### 3. StepKind
+
+Defines **what** the step does:
+
+```rust
+pub enum StepKind {
+    Shell(ShellStep),   // Deterministic command execution
+    Agent(AgentStep),   // AI-powered coding work
+}
+```
+
+From `crates/magpie-core/src/blueprint/step.rs:49-53`
+
+#### ShellStep
+
+Runs a command via the sandbox abstraction, captures output and exit code:
+
+```rust
+pub struct ShellStep {
+    pub command: String,
+    pub args: Vec<String>,
+}
+```
+
+From `crates/magpie-core/src/blueprint/steps/shell.rs:8-11`
+
+**Example:**
+```rust
+ShellStep::new("cargo").with_args(vec!["test".to_string()])
+```
+
+#### AgentStep
+
+Runs a Goose-powered AI agent with a prompt, optionally injecting prior output:
+
+```rust
+pub struct AgentStep {
+    pub prompt: String,
+    pub max_turns: Option<u32>,
+    pub include_last_output: bool,
+    pub context_metadata_key: Option<String>,
+}
+```
+
+From `crates/magpie-core/src/blueprint/steps/agent.rs:11-18`
+
+**Example:**
+```rust
+AgentStep::new("Fix the compilation errors")
+    .with_last_output()
+    .with_context_from_metadata("chat_history")
+```
+
+### 4. Condition
+
+Controls **when** a step runs:
+
+```rust
+pub enum Condition {
+    Always,
+    IfExitCode(i32),
+    IfExitCodeNot(i32),
+    IfOutputContains(String),
+}
+```
+
+From `crates/magpie-core/src/blueprint/step.rs:25-31`
+
+**Evaluation logic:**
+```rust
+impl Condition {
+    pub fn evaluate(&self, ctx: &StepContext) -> bool {
+        match self {
+            Condition::Always => true,
+            Condition::IfExitCode(code) => ctx.last_exit_code == Some(*code),
+            Condition::IfExitCodeNot(code) => ctx.last_exit_code != Some(*code),
+            Condition::IfOutputContains(needle) => ctx
+                .last_output
+                .as_ref()
+                .map(|out| out.contains(needle.as_str()))
+                .unwrap_or(false),
+        }
+    }
+}
+```
+
+From `crates/magpie-core/src/blueprint/step.rs:34-45`
+
+## StepContext: State Flow Between Steps
+
+The `StepContext` flows between steps, carrying shared state:
+
+```rust
+pub struct StepContext {
+    pub working_dir: PathBuf,
+    pub last_output: Option<String>,
+    pub last_exit_code: Option<i32>,
+    pub metadata: HashMap<String, String>,
+}
+```
+
+From `crates/magpie-core/src/blueprint/step.rs:5-11`
+
+**How it works:**
+1. Each step receives the current context
+2. The step executes (shell command or agent prompt)
+3. A new context is returned with updated `last_output` and `last_exit_code`
+4. The next step receives this updated context
+
+**Metadata** is used for cross-cutting concerns like:
+- `chat_history` — Discord/Teams conversation context
+- `trace_dir` — JSONL trace output directory
+
+## BlueprintRunner: Execution Engine
+
+The `BlueprintRunner` executes a blueprint step-by-step:
+
+```rust
+pub struct BlueprintRunner<'a> {
+    context: StepContext,
+    sandbox: &'a dyn Sandbox,
+}
+
+impl<'a> BlueprintRunner<'a> {
+    pub fn new(context: StepContext, sandbox: &'a dyn Sandbox) -> Self {
+        Self { context, sandbox }
+    }
+
+    pub async fn run(mut self, blueprint: &Blueprint) -> Result<StepContext> {
+        // ... execution logic
+    }
+}
+```
+
+From `crates/magpie-core/src/blueprint/runner.rs:29-39`
+
+### Execution Flow
+
+For each step, the runner:
+
+1. **Evaluates the condition** — Skip if not met
+2. **Executes the step** — Shell command or agent prompt
+3. **Checks the exit code** — Fail fast or continue on error
+4. **Updates the context** — Flow state to the next step
+
+```rust
+for (i, step) in blueprint.steps.iter().enumerate() {
+    // 1. Evaluate condition
+    if !step.condition.evaluate(&self.context) {
+        info!("[{}/{}] {} → skipped (condition not met)", step_num, total, step.name);
+        continue;
+    }
+
+    // 2. Execute step
+    let result = match &step.kind {
+        StepKind::Shell(shell) => shell.execute(&self.context, self.sandbox).await,
+        StepKind::Agent(agent) => agent.execute(&self.context, &step.name, self.sandbox).await,
+    };
+
+    // 3. Check exit code
+    match result {
+        Ok(new_ctx) => {
+            if let Some(code) = new_ctx.last_exit_code {
+                if code != 0 && !step.continue_on_error {
+                    bail!("step '{}' failed with exit code {code}", step.name);
+                }
+            }
+            self.context = new_ctx;
+        }
+        Err(e) if !step.continue_on_error => return Err(e),
+        Err(e) => warn!("continuing after error: {e}"),
+    }
+}
+```
+
+From `crates/magpie-core/src/blueprint/runner.rs:41-101`
+
+## Error Handling Modes
+
+Each step has a `continue_on_error` flag:
+
+- **`false` (default)** — Fail fast: stop the blueprint on non-zero exit or error
+- **`true`** — Continue: log warning and proceed to next step
+
+**Common use case:** TDD blueprints expect tests to fail initially:
+
+```rust
+Step {
+    name: "verify-tests-fail".to_string(),
+    kind: StepKind::Shell(ShellStep::new("cargo").with_args(vec!["test".to_string()])),
+    condition: Condition::Always,
+    continue_on_error: true, // expected to fail in red phase
+}
+```
+
+From `crates/magpie-core/src/pipeline.rs:456-461`
+
+## Built-in Blueprints
+
+Magpie ships with three production blueprints, selected based on task classification:
+
+<CardGroup cols={3}>
+  <Card title="Simple" icon="bolt" href="/blueprints/simple">
+    Single-shot agent call for docs, typos, renames
+  </Card>
+  <Card title="TDD" icon="flask" href="/blueprints/tdd">
+    Test-Driven Development flow for new features
+  </Card>
+  <Card title="Diagnostic" icon="stethoscope" href="/blueprints/diagnostic">
+    Root cause investigation for bug fixes
+  </Card>
+</CardGroup>
+
+Plus a **Fix** blueprint used in CI retry loops.
+
+## Why Blueprints Matter
+
+<AccordionGroup>
+  <Accordion title="Reproducibility">
+    The same blueprint with the same inputs produces similar behavior. This makes debugging and testing possible.
+  </Accordion>
+  
+  <Accordion title="Observability">
+    Each step logs `[N/M] step-name → running...` and `→ OK (exit 0)`. You can trace exactly where a workflow failed.
+  </Accordion>
+  
+  <Accordion title="Composability">
+    Build complex workflows by chaining simple steps. Shell steps provide determinism, agent steps provide intelligence.
+  </Accordion>
+  
+  <Accordion title="Testing">
+    Use `MockSandbox` to record/replay step executions without running real commands or agents. See tests in `runner.rs:234-267`.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Explore Built-in Blueprints" icon="book" href="/blueprints/simple">
+    See how Simple, TDD, and Diagnostic blueprints work in production
+  </Card>
+  <Card title="Build Custom Blueprints" icon="wrench" href="/blueprints/custom">
+    Learn to create your own blueprints with `Blueprint::new()` and `.add_step()`
+  </Card>
+</CardGroup>

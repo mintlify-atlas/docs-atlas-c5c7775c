@@ -1,0 +1,376 @@
+---
+title: 'Environment Variables'
+description: 'Complete reference for all Magpie environment variables'
+---
+
+## Overview
+
+All Magpie configuration is via environment variables. Copy `.env.example` or set them in your shell before running the CLI or adapters.
+
+## Pipeline Configuration
+
+These variables control core pipeline behavior across all adapters (CLI, Discord, Teams).
+
+<ParamField path="MAGPIE_REPO_DIR" type="string" default=".">
+  Path to the git repository to operate on. Ignored when `MAGPIE_GITHUB_ORG` is set.
+
+  **Example**:
+  ```bash
+  MAGPIE_REPO_DIR=/home/user/my-project
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_BASE_BRANCH" type="string" default="main">
+  Base branch for new feature branches. All Magpie branches are created from this branch and PRs target it.
+
+  **Example**:
+  ```bash
+  MAGPIE_BASE_BRANCH=develop
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_TEST_CMD" type="string" default="cargo test">
+  Command to run tests during the CI loop.
+
+  **Examples**:
+  ```bash
+  MAGPIE_TEST_CMD="cargo test"
+  MAGPIE_TEST_CMD="npm test"
+  MAGPIE_TEST_CMD="pytest tests/"
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_LINT_CMD" type="string" default="cargo clippy">
+  Command to run lints during the CI loop.
+
+  **Examples**:
+  ```bash
+  MAGPIE_LINT_CMD="cargo clippy"
+  MAGPIE_LINT_CMD="npm run lint"
+  MAGPIE_LINT_CMD="ruff check ."
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_MAX_CI_ROUNDS" type="integer" default="2">
+  Maximum number of lint→test→fix retry attempts.
+
+  **Example**:
+  ```bash
+  MAGPIE_MAX_CI_ROUNDS=3
+  ```
+</ParamField>
+
+<ParamField path="MAGPIE_GITHUB_ORG" type="string" optional>
+  GitHub organization to restrict repo access to. When set, Magpie dynamically resolves the target repo from the task message and clones it into a temp workspace.
+
+  **Example**:
+  ```bash
+  MAGPIE_GITHUB_ORG=my-company
+  ```
+
+  **Use Case**: Run a single Magpie instance across multiple repos in the same GitHub organization.
+</ParamField>
+
+## Plane (Issue Tracking)
+
+Optional integration with self-hosted Plane for automatic issue creation and updates.
+
+<ParamField path="PLANE_BASE_URL" type="string" optional>
+  Self-hosted Plane instance URL.
+
+  **Example**:
+  ```bash
+  PLANE_BASE_URL=https://plane.company.com
+  ```
+</ParamField>
+
+<ParamField path="PLANE_API_KEY" type="string" optional>
+  Plane API key for authentication.
+
+  **Example**:
+  ```bash
+  PLANE_API_KEY=plane_abc123...
+  ```
+</ParamField>
+
+<ParamField path="PLANE_WORKSPACE_SLUG" type="string" optional>
+  Workspace slug in Plane.
+
+  **Example**:
+  ```bash
+  PLANE_WORKSPACE_SLUG=engineering
+  ```
+</ParamField>
+
+<ParamField path="PLANE_PROJECT_ID" type="string" optional>
+  Project ID for auto-created issues.
+
+  **Example**:
+  ```bash
+  PLANE_PROJECT_ID=proj-xyz789
+  ```
+</ParamField>
+
+## Discord Bot
+
+Configuration for the Discord adapter (`magpie-discord`).
+
+<ParamField path="DISCORD_TOKEN" type="string" required>
+  Discord bot token for authentication.
+
+  **Example**:
+  ```bash
+  DISCORD_TOKEN=MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.AbCdEf.GhIjKlMnOpQrStUvWxYz
+  ```
+
+  **How to Get**:
+  1. Create a bot at https://discord.com/developers/applications
+  2. Enable **Message Content Intent** in Bot settings
+  3. Copy the bot token
+</ParamField>
+
+## Teams Webhook
+
+Configuration for the Teams adapter (`magpie-teams`).
+
+<ParamField path="TEAMS_APP_ID" type="string" required>
+  Bot Framework app ID.
+
+  **Example**:
+  ```bash
+  TEAMS_APP_ID=12345678-1234-1234-1234-123456789abc
+  ```
+</ParamField>
+
+<ParamField path="TEAMS_APP_SECRET" type="string" required>
+  Bot Framework app secret.
+
+  **Example**:
+  ```bash
+  TEAMS_APP_SECRET=AbCdEfGhIjKlMnOpQrStUvWxYz123456
+  ```
+</ParamField>
+
+<ParamField path="TEAMS_LISTEN_ADDR" type="string" default="0.0.0.0:3978">
+  Address for the webhook server.
+
+  **Example**:
+  ```bash
+  TEAMS_LISTEN_ADDR=127.0.0.1:8080
+  ```
+</ParamField>
+
+## Daytona Sandbox
+
+Configuration for remote Daytona sandbox execution (feature-gated: requires `daytona` feature).
+
+<ParamField path="DAYTONA_API_KEY" type="string" optional>
+  Daytona API key for authentication.
+
+  **Example**:
+  ```bash
+  DAYTONA_API_KEY=daytona_abc123...
+  ```
+
+  **Note**: When set, all pipeline commands execute inside a Daytona sandbox instead of locally.
+</ParamField>
+
+<ParamField path="DAYTONA_BASE_URL" type="string" default="https://app.daytona.io/api">
+  Daytona API base URL.
+
+  **Example**:
+  ```bash
+  DAYTONA_BASE_URL=https://daytona.company.com/api
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_ORGANIZATION_ID" type="string" optional>
+  Daytona organization ID (for multi-org accounts).
+
+  **Example**:
+  ```bash
+  DAYTONA_ORGANIZATION_ID=org-123456
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_SANDBOX_CLASS" type="string" default="small">
+  Sandbox size class: `small`, `medium`, `large`, etc.
+
+  **Example**:
+  ```bash
+  DAYTONA_SANDBOX_CLASS=large
+  ```
+</ParamField>
+
+<ParamField path="DAYTONA_SNAPSHOT_NAME" type="string" optional>
+  Daytona snapshot name to create sandboxes from (pre-built image with dependencies).
+
+  **Example**:
+  ```bash
+  DAYTONA_SNAPSHOT_NAME=magpie-self
+  ```
+
+  **Use Case**: Fast sandbox creation (5-10 seconds vs 5-10 minutes for cold clone+build).
+</ParamField>
+
+<ParamField path="DAYTONA_ENV" type="string" optional>
+  Comma-separated `KEY=VALUE` pairs to inject into sandboxes at creation time.
+
+  **Example**:
+  ```bash
+  DAYTONA_ENV="CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...,GH_TOKEN=github_pat_..."
+  ```
+
+  **Use Case**: Pass API keys and tokens to sandboxes without baking them into snapshots.
+</ParamField>
+
+<ParamField path="DAYTONA_VOLUME_ID" type="string" optional>
+  Persistent volume UUID for build cache (e.g. cargo target dir, node_modules).
+
+  **Example**:
+  ```bash
+  DAYTONA_VOLUME_ID=12345678-1234-1234-1234-123456789abc
+  ```
+
+  **Use Case**: Speed up builds by preserving compiled artifacts across sandbox instances.
+</ParamField>
+
+<ParamField path="DAYTONA_VOLUME_MOUNT_PATH" type="string" optional>
+  Mount point for the persistent volume inside the sandbox.
+
+  **Example**:
+  ```bash
+  DAYTONA_VOLUME_MOUNT_PATH=/workspace/target
+  ```
+
+  **Note**: Must be set if `DAYTONA_VOLUME_ID` is set.
+</ParamField>
+
+## External Dependencies
+
+These are not Magpie-specific, but are required for the system to function.
+
+<ParamField path="CLAUDE_CODE_OAUTH_TOKEN" type="string" required>
+  Anthropic API key for Claude Code (both Tier 1 and Tier 2 agent calls).
+
+  **Example**:
+  ```bash
+  CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-...
+  ```
+
+  **How to Get**:
+  1. Visit https://console.anthropic.com/settings/keys
+  2. Create a new API key
+  3. Copy and set as env var
+
+  **Note**: The Claude CLI (`claude -p`) reads this variable automatically.
+</ParamField>
+
+<ParamField path="GH_TOKEN" type="string" required>
+  GitHub personal access token for git operations (clone, push, PR creation).
+
+  **Example**:
+  ```bash
+  GH_TOKEN=github_pat_...
+  ```
+
+  **How to Get**:
+  1. Visit https://github.com/settings/tokens
+  2. Generate a new token with `repo` scope
+  3. Copy and set as env var
+
+  **Note**: The GitHub CLI (`gh`) reads this variable automatically.
+</ParamField>
+
+## Example .env Files
+
+### Minimal Local Setup
+
+```bash
+# External dependencies (required)
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-...
+GH_TOKEN=github_pat_...
+
+# Pipeline (defaults work for most Rust projects)
+MAGPIE_REPO_DIR=.
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy"
+MAGPIE_MAX_CI_ROUNDS=2
+```
+
+### Production Discord Bot with Daytona
+
+```bash
+# External dependencies
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-...
+GH_TOKEN=github_pat_...
+
+# Discord
+DISCORD_TOKEN=MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.AbCdEf.GhIjKlMnOpQrStUvWxYz
+
+# Pipeline
+MAGPIE_GITHUB_ORG=my-company
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy"
+MAGPIE_MAX_CI_ROUNDS=2
+
+# Plane
+PLANE_BASE_URL=https://plane.company.com
+PLANE_API_KEY=plane_abc123...
+PLANE_WORKSPACE_SLUG=engineering
+PLANE_PROJECT_ID=proj-xyz789
+
+# Daytona
+DAYTONA_API_KEY=daytona_abc123...
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_SANDBOX_CLASS=large
+DAYTONA_SNAPSHOT_NAME=magpie-self
+DAYTONA_ENV="CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...,GH_TOKEN=github_pat_..."
+DAYTONA_VOLUME_ID=12345678-1234-1234-1234-123456789abc
+DAYTONA_VOLUME_MOUNT_PATH=/workspace/target
+```
+
+### Multi-Repo Setup with Tracing
+
+```bash
+# External dependencies
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-api03-...
+GH_TOKEN=github_pat_...
+
+# Pipeline
+MAGPIE_GITHUB_ORG=my-company
+MAGPIE_BASE_BRANCH=main
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy"
+MAGPIE_MAX_CI_ROUNDS=3
+
+# Tracing
+MAGPIE_TRACE_DIR=.magpie/traces
+
+# Plane
+PLANE_BASE_URL=https://plane.company.com
+PLANE_API_KEY=plane_abc123...
+PLANE_WORKSPACE_SLUG=engineering
+PLANE_PROJECT_ID=proj-xyz789
+```
+
+## Configuration Priority
+
+Magpie loads configuration in this order:
+
+1. **`.env` file** — loaded via `dotenvy::dotenv()` at startup
+2. **System environment variables** — override `.env` values
+3. **Code defaults** — `PipelineConfig::default()` fills in missing values
+
+This allows you to:
+- Keep secrets in `.env` (gitignored)
+- Override specific values via environment variables in production
+- Rely on sensible defaults for most settings
+
+## Related Documentation
+
+- [Pipeline Configuration](/configuration/pipeline) — Detailed PipelineConfig reference
+- [Plane Configuration](/configuration/plane) — Issue tracking integration
+- [Sandbox Configuration](/configuration/sandbox) — Daytona sandbox setup

@@ -1,0 +1,632 @@
+---
+title: 'Daytona Integration'
+description: 'Remote sandbox execution, warm pools, and snapshot-based provisioning'
+---
+
+## Overview
+
+Magpie integrates with **Daytona** to execute pipeline runs in isolated remote sandboxes via REST API. This enables:
+
+- **Concurrent pipelines** without filesystem conflicts
+- **Reproducible environments** via pre-built snapshots
+- **Warm sandbox pools** for sub-second acquisition
+- **Persistent build caches** via volume attachments
+
+Daytona sandboxes replace `LocalSandbox` when `DAYTONA_API_KEY` is set and the `daytona` feature is enabled.
+
+## Configuration
+
+### Environment Variables
+
+<ParamField path="DAYTONA_API_KEY" type="string" required>
+  Daytona API key for authentication. Get yours at [app.daytona.io](https://app.daytona.io).
+</ParamField>
+
+<ParamField path="DAYTONA_BASE_URL" type="string" default="https://app.daytona.io/api">
+  Daytona API base URL. Use the default for Daytona Cloud.
+</ParamField>
+
+<ParamField path="DAYTONA_ORGANIZATION_ID" type="string" optional>
+  Organization ID for multi-tenant deployments.
+</ParamField>
+
+<ParamField path="DAYTONA_SANDBOX_CLASS" type="string" default="small">
+  Sandbox size class: `small`, `medium`, `large`. Determines CPU/RAM allocation.
+</ParamField>
+
+<ParamField path="DAYTONA_SNAPSHOT_NAME" type="string" optional>
+  Pre-built snapshot to create sandboxes from. Enables warm starts.
+</ParamField>
+
+<ParamField path="DAYTONA_ENV" type="string" optional>
+  Comma-separated `key=value` pairs injected into sandboxes at creation time.
+  
+  Example: `ANTHROPIC_API_KEY=sk-ant-...,GH_TOKEN=github_pat_...`
+</ParamField>
+
+<ParamField path="DAYTONA_VOLUME_ID" type="string" optional>
+  Persistent volume UUID for build cache (e.g., cargo `target/` dir).
+</ParamField>
+
+<ParamField path="DAYTONA_VOLUME_MOUNT_PATH" type="string" optional>
+  Mount point for the persistent volume inside the sandbox.
+</ParamField>
+
+### Build Configuration
+
+Enable the `daytona` feature in your `Cargo.toml`:
+
+```toml Cargo.toml
+[dependencies]
+magpie-core = { path = "../magpie-core", features = ["daytona"] }
+```
+
+Or build with:
+
+```bash
+cargo build -p magpie-discord --features daytona
+```
+
+## DaytonaSandbox
+
+### Creation Modes
+
+<Tabs>
+  <Tab title="Cold Clone">
+    Creates a fresh sandbox and clones the repo using `gh repo clone`:
+    
+    <CodeGroup>
+    ```rust daytona.rs:33
+    pub async fn create(config: &DaytonaConfig, repo_full_name: &str) -> Result<Self> {
+        let client = DaytonaClient::new(daytona_config)
+            .context("failed to create Daytona client")?;
+
+        let sandbox = client
+            .sandboxes()
+            .create(CreateSandboxParams {
+                class: Some(config.sandbox_class.clone()),
+                env: Some(config.env_vars.clone()),
+                ..Default::default()
+            })
+            .await?;
+
+        let sandbox_id = sandbox.id;
+        let working_dir = format!("/workspace/{}", repo_full_name.replace('/', "-"));
+
+        // Clone the repo inside the sandbox
+        let clone_cmd = format!("gh repo clone {repo_full_name} {working_dir}");
+        let result = client
+            .process()
+            .execute_command(&sandbox_id, &clone_cmd)
+            .await?;
+
+        if result.exit_code != 0 {
+            let _ = client.sandboxes().delete(&sandbox_id).await;
+            anyhow::bail!("gh repo clone failed: {}", result.result);
+        }
+
+        Ok(Self { client, sandbox_id, working_dir })
+    }
+    ```
+    </CodeGroup>
+    
+    **Use case:** First run, or when no snapshot exists.
+    
+    **Time:** 30-60 seconds (sandbox creation + clone)
+  </Tab>
+  
+  <Tab title="Snapshot-Based">
+    Creates a sandbox from a pre-built snapshot with repo + dependencies baked in:
+    
+    <CodeGroup>
+    ```rust daytona.rs:90
+    pub async fn create_from_snapshot(
+        config: &DaytonaConfig,
+        snapshot_name: &str,
+        working_dir: &str,
+        env: HashMap<String, String>,
+        volumes: Vec<SandboxVolumeAttachment>,
+    ) -> Result<Self> {
+        let client = DaytonaClient::new(daytona_config)?;
+
+        let sandbox = client
+            .sandboxes()
+            .create(CreateSandboxParams {
+                snapshot: Some(snapshot_name.to_string()),
+                class: Some(config.sandbox_class.clone()),
+                env: if env.is_empty() { None } else { Some(env) },
+                volumes: if volumes.is_empty() { None } else { Some(volumes) },
+                ..Default::default()
+            })
+            .await?;
+
+        let sandbox_id = sandbox.id;
+
+        // Wait for sandbox to reach Started state (large images take up to 5 min)
+        client
+            .sandboxes()
+            .wait_for_state(&sandbox_id, SandboxState::Started, 300)
+            .await?;
+
+        // Configure git and auth inside the sandbox
+        let setup_cmd = format!(
+            "sh -c 'sudo git config --system --add safe.directory {working_dir}; \
+             sudo git config --system user.email magpie@bot; \
+             sudo git config --system user.name Magpie; \
+             sudo chmod -R 777 {wd} 2>/dev/null || true; \
+             cd {wd} && git checkout -- . 2>/dev/null || true; \
+             gh auth setup-git 2>/dev/null || true'"
+        );
+        client.process().execute_command(&sandbox_id, &setup_cmd).await?;
+
+        Ok(Self { client, sandbox_id, working_dir: working_dir.to_string() })
+    }
+    ```
+    </CodeGroup>
+    
+    **Use case:** Production deployments with warm pools.
+    
+    **Time:** 5-10 seconds (snapshot start + git setup)
+  </Tab>
+</Tabs>
+
+### Sandbox Trait Implementation
+
+`DaytonaSandbox` implements the `Sandbox` trait:
+
+<CodeGroup>
+```rust daytona.rs:244
+#[async_trait]
+impl Sandbox for DaytonaSandbox {
+    fn name(&self) -> &str {
+        "daytona"
+    }
+
+    fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+
+    async fn exec(&self, command: &str, args: &[&str]) -> Result<ExecOutput> {
+        // Daytona's execute_command does NOT use a shell,
+        // so we wrap in `sh -c '...'` to support shell operators (&&, |, etc.)
+        let inner = if args.is_empty() {
+            format!("cd {} && {}", self.working_dir, command)
+        } else {
+            let args_str = args.iter().map(|a| shell_escape(a)).collect::<Vec<_>>().join(" ");
+            format!("cd {} && {} {}", self.working_dir, command, args_str)
+        };
+        let full_cmd = format!("sh -c {}", shell_escape(&inner));
+
+        let result = self.client
+            .process()
+            .execute_command(&self.sandbox_id, &full_cmd)
+            .await?;
+
+        Ok(ExecOutput {
+            stdout: result.result.clone(),
+            stderr: String::new(),  // Daytona combines output into result
+            exit_code: result.exit_code,
+        })
+    }
+
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let full_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/{}", self.working_dir, path)
+        };
+        self.client.files().download(&self.sandbox_id, &full_path).await
+    }
+
+    async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
+        let full_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/{}", self.working_dir, path)
+        };
+        self.client.files().upload(&self.sandbox_id, &full_path, content).await
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        self.client.sandboxes().delete(&self.sandbox_id).await
+    }
+}
+```
+</CodeGroup>
+
+<Note>
+Daytona's `execute_command` does **not** use a shell, so commands with `&&`, `|`, or `cd` must be wrapped in `sh -c '...'`. The implementation handles this automatically.
+</Note>
+
+## Warm Sandbox Pool
+
+The **warm pool** pre-provisions sandboxes from snapshots and maintains them in an idle state. When a pipeline run starts, it acquires a warm sandbox in milliseconds instead of waiting 30+ seconds for a cold start.
+
+### Architecture
+
+<Steps>
+  <Step title="Provision">
+    At startup, the pool creates `pool_size` sandboxes per repo from the specified snapshot.
+  </Step>
+  <Step title="Acquire">
+    When a pipeline run starts, it calls `pool.acquire(repo_full_name)` to get an idle sandbox.
+  </Step>
+  <Step title="Execute">
+    The pipeline runs in the acquired sandbox. Git state is modified (new branch, commits).
+  </Step>
+  <Step title="Release">
+    After the run completes, the sandbox is released back to the pool. Git state is reset to base branch.
+  </Step>
+  <Step title="Refresh">
+    A background loop periodically runs `git fetch && cargo check` on idle sandboxes to keep them warm.
+  </Step>
+</Steps>
+
+### Configuration
+
+<CodeGroup>
+```rust Example Pool Config
+use magpie_core::sandbox::pool::{WarmPool, WarmPoolConfig, RepoPoolConfig};
+
+let pool_config = WarmPoolConfig {
+    pool_size: 3,  // 3 sandboxes per repo
+    refresh_interval_secs: 300,  // refresh every 5 minutes
+    daytona: daytona_config.clone(),
+    repos: vec![
+        RepoPoolConfig {
+            repo_name: "api-service".to_string(),
+            repo_full_name: "myorg/api-service".to_string(),
+            snapshot_name: "myorg-api-service-snapshot".to_string(),
+            sandbox_class: "large".to_string(),  // override default class
+            base_branch: "main".to_string(),
+            build_check_cmd: Some("cargo check --all-features".to_string()),
+            volume_id: Some("vol-abc123".to_string()),
+            volume_mount_path: Some("/workspace/api-service/target".to_string()),
+            env_vars: HashMap::new(),
+        },
+    ],
+};
+
+let pool = Arc::new(WarmPool::new(pool_config));
+pool.provision().await?;
+pool.start_refresh_loop().await;
+```
+</CodeGroup>
+
+### Workspace States
+
+<ResponseField name="WorkspaceStatus" type="enum">
+  <Expandable title="States">
+    <ResponseField name="Provisioning">
+      Sandbox is being created from snapshot. Not yet ready for acquisition.
+    </ResponseField>
+    <ResponseField name="Idle">
+      Ready for acquisition. Git state is clean (on base branch, no uncommitted changes).
+    </ResponseField>
+    <ResponseField name="Busy">
+      Currently in use by a pipeline run. Cannot be acquired.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Acquisition
+
+Pipelines try to acquire a warm sandbox before falling back to cold creation:
+
+<CodeGroup>
+```rust pipeline.rs:798
+let pooled: Option<Box<dyn Sandbox>> = if let Some(ref pool) = config.pool {
+    match pool.acquire(&full_name).await {
+        Some(ws) => {
+            info!(org, repo = %repo_name, "acquired warm pooled sandbox");
+            Some(Box::new(crate::sandbox::pooled::PooledSandbox::new(
+                ws,
+                Arc::clone(pool),
+                config.base_branch.clone(),
+            )))
+        }
+        None => {
+            info!(org, repo = %repo_name, "no idle pooled sandbox — falling back to cold clone");
+            None
+        }
+    }
+} else {
+    None
+};
+
+if let Some(sandbox) = pooled {
+    sandbox
+} else if let Some(ref daytona_cfg) = config.daytona {
+    // Cold creation from snapshot or clone...
+}
+```
+</CodeGroup>
+
+<Tip>
+The pool does **not** block when all sandboxes are busy. It immediately returns `None`, and the pipeline falls back to cold creation. This ensures zero queuing delays.
+</Tip>
+
+### Release and Reset
+
+After a pipeline run completes, the `PooledSandbox` wrapper automatically releases the workspace back to the pool:
+
+<CodeGroup>
+```rust pooled.rs:31
+impl Sandbox for PooledSandbox {
+    async fn destroy(&self) -> Result<()> {
+        // Release back to pool instead of destroying
+        self.pool.release(&self.workspace, &self.base_branch).await?;
+        Ok(())
+    }
+}
+```
+</CodeGroup>
+
+The release logic resets git state but preserves build artifacts:
+
+<CodeGroup>
+```rust pool.rs:314
+pub async fn release(&self, workspace: &Arc<Workspace>, base_branch: &str) -> Result<()> {
+    // Reset git state but preserve build artifacts
+    let reset_cmd = format!(
+        "cd {} && git checkout {} && git clean -fd -e target/ -e node_modules/ -e .next/ && git reset --hard origin/{}",
+        workspace.working_dir, base_branch, base_branch
+    );
+    workspace.sandbox.exec_shell(&reset_cmd).await?;
+
+    workspace.set_status(WorkspaceStatus::Idle);
+    Ok(())
+}
+```
+</CodeGroup>
+
+<Note>
+The `-e` flags in `git clean` exclude build directories from deletion. This preserves incremental compilation artifacts between pipeline runs.
+</Note>
+
+### Refresh Loop
+
+A background tokio task periodically refreshes idle workspaces:
+
+<CodeGroup>
+```rust pool.rs:341
+pub async fn start_refresh_loop(&self) {
+    let workspaces = Arc::clone(&self.workspaces);
+    let shutdown = Arc::clone(&self.shutdown);
+    let interval = Duration::from_secs(self.config.refresh_interval_secs);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {},
+                _ = shutdown.notified() => return,
+            }
+
+            let lock = workspaces.lock().await;
+            let idle: Vec<Arc<Workspace>> = lock
+                .iter()
+                .filter(|ws| ws.status() == WorkspaceStatus::Idle)
+                .cloned()
+                .collect();
+            drop(lock);
+
+            for ws in idle {
+                // git fetch + reset
+                let fetch_cmd = format!(
+                    "cd {} && git fetch origin {} && git reset --hard origin/{}",
+                    ws.working_dir, base_branch, base_branch
+                );
+                ws.sandbox.exec_shell(&fetch_cmd).await?;
+
+                // Optional build check
+                if let Some(ref cmd) = build_cmd {
+                    let full_cmd = format!("cd {} && {}", ws.working_dir, cmd);
+                    ws.sandbox.exec_shell(&full_cmd).await?;
+                }
+            }
+        }
+    });
+}
+```
+</CodeGroup>
+
+## Snapshot Specs
+
+Snapshots are pre-built Docker images that include:
+
+1. **Base OS** (Ubuntu 22.04 or Debian-based)
+2. **Toolchain** (Rust, Node.js, Python, etc.)
+3. **CLI tools** (`gh`, `git`, `claude`)
+4. **Repository clone** (optional, but recommended)
+5. **Build cache** (optional: pre-compiled dependencies)
+
+### Creating Snapshots
+
+Magpie uses the `aurumintel/magpie-devbox:latest` Docker image as a base:
+
+<CodeGroup>
+```dockerfile Example Dockerfile
+FROM ubuntu:22.04
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y \
+    git curl build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update && apt-get install -y gh
+
+# Install Claude CLI
+RUN curl -fsSL https://download.claudeai.dev/install.sh | bash
+
+# Pre-clone repo (optional)
+WORKDIR /workspace
+RUN git clone https://github.com/myorg/api-service.git
+
+# Pre-fetch dependencies (optional)
+WORKDIR /workspace/api-service
+RUN cargo fetch
+```
+</CodeGroup>
+
+### Registering Snapshots
+
+After building the Docker image, push it and register a Daytona snapshot:
+
+```bash
+# Build and push image
+docker build -t myregistry/api-service-devbox:latest .
+docker push myregistry/api-service-devbox:latest
+
+# Register snapshot (Daytona CLI or API)
+daytona snapshot create \
+  --name api-service-snapshot \
+  --image myregistry/api-service-devbox:latest
+```
+
+Or use Magpie's `ensure_snapshot()` helper:
+
+<CodeGroup>
+```rust snapshots.rs
+use magpie_core::sandbox::snapshots::ensure_snapshot;
+
+let snapshot_name = ensure_snapshot(&daytona_config, "api-service-snapshot").await?;
+```
+</CodeGroup>
+
+### Overlay Filesystem Constraints
+
+<Warning>
+Daytona sandboxes use OverlayFS with **~3 GB writable space**. Any files modified from the snapshot image trigger copy-on-write, consuming overlay space.
+
+**Critical rules:**
+1. **NEVER** run `chmod -R` or `chown -R` on large directories at runtime (causes disk full)
+2. Pre-compile dependencies in the snapshot image (run `cargo fetch` during Docker build)
+3. Use persistent volumes for build caches (`target/` dir)
+4. Run `git config --system` (not `--global`) to avoid HOME dependency
+</Warning>
+
+## Environment Variables in Sandboxes
+
+Daytona sandboxes require API keys and tokens for authentication:
+
+<ParamField path="ANTHROPIC_API_KEY" type="string" required>
+  Claude API key for agent calls inside the sandbox.
+</ParamField>
+
+<ParamField path="GH_TOKEN" type="string" required>
+  GitHub personal access token for `gh repo clone` and authenticated git push.
+</ParamField>
+
+<ParamField path="CLAUDE_CODE_OAUTH_TOKEN" type="string" optional>
+  OAuth token for `claude` CLI if using OAuth instead of API key.
+</ParamField>
+
+### Injection via DAYTONA_ENV
+
+Set `DAYTONA_ENV` to inject variables at sandbox creation time:
+
+```bash
+export DAYTONA_ENV="ANTHROPIC_API_KEY=sk-ant-...,GH_TOKEN=github_pat_..."
+```
+
+Magpie parses this and passes it to `CreateSandboxParams`:
+
+<CodeGroup>
+```rust Parsing Logic
+let env: HashMap<String, String> = std::env::var("DAYTONA_ENV")
+    .unwrap_or_default()
+    .split(',')
+    .filter_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        Some((k.trim().to_string(), v.trim().to_string()))
+    })
+    .collect();
+```
+</CodeGroup>
+
+## Performance
+
+### Cold Start (No Snapshot)
+
+<Steps>
+  <Step title="Create sandbox" icon="plus">
+    API call to Daytona → 5-10s
+  </Step>
+  <Step title="Clone repo" icon="download">
+    `gh repo clone` → 10-30s (depends on repo size)
+  </Step>
+  <Step title="Total">
+    **15-40 seconds**
+  </Step>
+</Steps>
+
+### Warm Start (Snapshot, No Pool)
+
+<Steps>
+  <Step title="Create from snapshot" icon="layer-group">
+    API call + image pull → 5-10s
+  </Step>
+  <Step title="Git setup" icon="git">
+    Configure safe.directory + auth → 1-2s
+  </Step>
+  <Step title="Total">
+    **6-12 seconds**
+  </Step>
+</Steps>
+
+### Pooled Warm Start
+
+<Steps>
+  <Step title="Acquire from pool" icon="bolt">
+    Lock + status check → under 100ms
+  </Step>
+  <Step title="Checkout base branch" icon="code-branch">
+    Already on base, no-op → under 100ms
+  </Step>
+  <Step title="Total">
+    Under 200ms (sub-second)
+  </Step>
+</Steps>
+
+## Testing
+
+### Unit Tests
+
+```bash
+cargo test -p magpie-core --features daytona -- daytona
+```
+
+### Integration Tests (Requires API Key)
+
+```bash
+export DAYTONA_API_KEY="..."
+cargo test -p magpie-core --features daytona -- daytona --ignored
+```
+
+Key test cases:
+- ✅ `test_daytona_sandbox_connectivity`
+- ✅ `test_magpie_devbox` (end-to-end snapshot test)
+- ✅ `test_sandbox_env_vars` (verify secret injection)
+- ✅ `test_pipeline_sandbox_flow` (git ops)
+- ✅ `test_claude_in_sandbox` (agent call)
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Org-Scoped Repos" icon="building" href="/advanced/org-scoped-repos">
+    Dynamic repo resolution for multi-repo deployments
+  </Card>
+  <Card title="Sandbox Abstraction" icon="cube" href="/concepts/sandbox">
+    Trait design and LocalSandbox comparison
+  </Card>
+</CardGroup>

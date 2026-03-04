@@ -1,0 +1,687 @@
+---
+title: Blueprint Engine
+description: Hybrid orchestration of deterministic and agent steps with conditional flow control
+---
+
+The blueprint engine is the core of Magpie's deterministic-step + agent-step model. It provides fine-grained control over the execution flow while allowing the LLM to handle coding work.
+
+## Core Concepts
+
+<CardGroup cols={2}>
+  <Card title="Blueprint" icon="file-code">
+    A named sequence of steps that define a workflow
+  </Card>
+  <Card title="Step" icon="shoe-prints">
+    A single unit of work (Shell or Agent)
+  </Card>
+  <Card title="Condition" icon="code-branch">
+    Control flow logic based on exit codes or output
+  </Card>
+  <Card title="StepContext" icon="database">
+    Shared state flowing between steps
+  </Card>
+</CardGroup>
+
+## Blueprint Structure
+
+```rust title="blueprint/runner.rs:7-26"
+#[derive(Debug)]
+pub struct Blueprint {
+    pub name: String,
+    pub steps: Vec<Step>,
+}
+
+impl Blueprint {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            steps: Vec::new(),
+        }
+    }
+
+    pub fn add_step(mut self, step: Step) -> Self {
+        self.steps.push(step);
+        self
+    }
+}
+```
+
+## Step Definition
+
+```rust title="blueprint/step.rs:48-62"
+#[derive(Debug, Clone)]
+pub enum StepKind {
+    Shell(super::steps::ShellStep),
+    Agent(super::steps::AgentStep),
+}
+
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub name: String,
+    pub kind: StepKind,
+    pub condition: Condition,
+    pub continue_on_error: bool,
+}
+```
+
+### Shell Steps
+
+Deterministic command execution:
+
+```rust title="blueprint/steps/shell.rs:7-24"
+#[derive(Debug, Clone)]
+pub struct ShellStep {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl ShellStep {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+        }
+    }
+
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+}
+```
+
+**Example:** Scan repository files
+
+```rust
+Step {
+    name: "scan-repo".to_string(),
+    kind: StepKind::Shell(ShellStep::new("find").with_args(vec![
+        repo_dir,
+        "-type".to_string(),
+        "f".to_string(),
+        "-not".to_string(),
+        "-path".to_string(),
+        "*/.git/*".to_string(),
+        "-not".to_string(),
+        "-path".to_string(),
+        "*/target/*".to_string(),
+    ])),
+    condition: Condition::Always,
+    continue_on_error: false,
+}
+```
+
+### Agent Steps
+
+LLM-powered coding tasks:
+
+```rust title="blueprint/steps/agent.rs:9-30"
+#[derive(Debug, Clone)]
+pub struct AgentStep {
+    pub prompt: String,
+    pub max_turns: Option<u32>,
+    pub include_last_output: bool,
+    /// If set, prepend the value of this metadata key from StepContext to the prompt.
+    pub context_metadata_key: Option<String>,
+    pub step_name: Option<String>,
+}
+
+impl AgentStep {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            max_turns: None,
+            include_last_output: false,
+            context_metadata_key: None,
+            step_name: None,
+        }
+    }
+
+    pub fn with_last_output(mut self) -> Self {
+        self.include_last_output = true;
+        self
+    }
+
+    pub fn with_context_from_metadata(mut self, key: impl Into<String>) -> Self {
+        self.context_metadata_key = Some(key.into());
+        self
+    }
+}
+```
+
+**Example:** TDD implementation step
+
+```rust title="pipeline.rs:475-494"
+Step {
+    name: "implement".to_string(),
+    kind: StepKind::Agent(
+        AgentStep::new(format!(
+            "The tests from the previous step have been run. The output (including any \
+             failures or compilation errors) is provided as previous step output.\n\n\
+             Task: {}\n\n\
+             Now write the implementation to make all tests pass.\n\
+             - Fix any compilation errors in the tests if needed\n\
+             - Implement the actual feature/change\n\
+             - Make sure all tests pass",
+            trigger.message
+        ))
+        .with_last_output()
+        .with_context_from_metadata("chat_history"),
+    ),
+    condition: Condition::Always,
+    continue_on_error: false,
+}
+```
+
+## Conditions
+
+```rust title="blueprint/step.rs:24-46"
+#[derive(Debug, Clone)]
+pub enum Condition {
+    Always,
+    IfExitCode(i32),
+    IfExitCodeNot(i32),
+    IfOutputContains(String),
+}
+
+impl Condition {
+    pub fn evaluate(&self, ctx: &StepContext) -> bool {
+        match self {
+            Condition::Always => true,
+            Condition::IfExitCode(code) => ctx.last_exit_code == Some(*code),
+            Condition::IfExitCodeNot(code) => ctx.last_exit_code != Some(*code),
+            Condition::IfOutputContains(needle) => ctx
+                .last_output
+                .as_ref()
+                .map(|out| out.contains(needle.as_str()))
+                .unwrap_or(false),
+        }
+    }
+}
+```
+
+<Info>
+Conditions are evaluated before running each step. If the condition returns `false`, the step is skipped.
+</Info>
+
+## StepContext
+
+Shared state flows between steps:
+
+```rust title="blueprint/step.rs:4-22"
+#[derive(Debug, Clone)]
+pub struct StepContext {
+    pub working_dir: PathBuf,
+    pub last_output: Option<String>,
+    pub last_exit_code: Option<i32>,
+    pub metadata: HashMap<String, String>,
+}
+
+impl StepContext {
+    pub fn new(working_dir: PathBuf) -> Self {
+        Self {
+            working_dir,
+            last_output: None,
+            last_exit_code: None,
+            metadata: HashMap::new(),
+        }
+    }
+}
+```
+
+**Metadata usage:**
+- `chat_history`: Conversation context from the chat platform
+- `trace_dir`: Path to JSONL trace files
+- Custom keys: Blueprint-specific data
+
+## BlueprintRunner
+
+Executes steps sequentially with condition evaluation:
+
+```rust title="blueprint/runner.rs:28-106"
+pub struct BlueprintRunner<'a> {
+    context: StepContext,
+    sandbox: &'a dyn Sandbox,
+}
+
+impl<'a> BlueprintRunner<'a> {
+    pub fn new(context: StepContext, sandbox: &'a dyn Sandbox) -> Self {
+        Self { context, sandbox }
+    }
+
+    pub async fn run(mut self, blueprint: &Blueprint) -> Result<StepContext> {
+        let total = blueprint.steps.len();
+        for (i, step) in blueprint.steps.iter().enumerate() {
+            let step_num = i + 1;
+
+            // 1. Evaluate condition
+            if !step.condition.evaluate(&self.context) {
+                info!(
+                    "[{}/{}] {} → skipped (condition not met)",
+                    step_num, total, step.name
+                );
+                continue;
+            }
+
+            info!(
+                "[{}/{}] {} ({}) → running...",
+                step_num, total, step.name, kind_label
+            );
+
+            // 2. Execute step
+            let result = match &step.kind {
+                StepKind::Shell(shell) => shell.execute(&self.context, self.sandbox).await,
+                StepKind::Agent(agent) => {
+                    agent.execute(&self.context, &step.name, self.sandbox).await
+                }
+            };
+
+            match result {
+                Ok(new_ctx) => {
+                    // 3. Check exit code for shell steps
+                    if let Some(code) = new_ctx.last_exit_code {
+                        if code != 0 {
+                            if step.continue_on_error {
+                                warn!(
+                                    "[{}/{}] {} → exit {code} (continuing)",
+                                    step_num, total, step.name
+                                );
+                            } else {
+                                bail!("step '{}' failed with exit code {code}", step.name);
+                            }
+                        } else {
+                            info!("[{}/{}] {} → OK (exit 0)", step_num, total, step.name);
+                        }
+                    } else {
+                        info!("[{}/{}] {} → OK", step_num, total, step.name);
+                    }
+                    self.context = new_ctx;
+                }
+                Err(e) => {
+                    if !step.continue_on_error {
+                        return Err(e.context(format!("step '{}' errored", step.name)));
+                    }
+                    warn!("[{}/{}] {} → error (continuing): {e}", step_num, total, step.name);
+                }
+            }
+        }
+
+        Ok(self.context)
+    }
+}
+```
+
+## Built-in Blueprints
+
+### Simple Blueprint
+
+Single-shot agent call for docs and trivial changes:
+
+```rust title="pipeline.rs:251-293"
+pub fn build_main_blueprint(
+    trigger: &TriggerContext,
+    config: &PipelineConfig,
+    working_dir: &str,
+) -> Result<(Blueprint, StepContext)> {
+    let mut ctx = StepContext::new(PathBuf::from(working_dir));
+    trigger.hydrate(&mut ctx);
+
+    let execute_step = if config.dry_run {
+        Step {
+            name: "execute-task".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("echo").with_args(vec![format!("dry-run: {}", trigger.message)]),
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        }
+    } else {
+        Step {
+            name: "execute-task".to_string(),
+            kind: StepKind::Agent(
+                AgentStep::new(&trigger.message).with_context_from_metadata("chat_history"),
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        }
+    };
+
+    let blueprint = Blueprint::new("magpie-main")
+        .add_step(Step {
+            name: "validate-workspace".to_string(),
+            kind: StepKind::Shell(ShellStep::new("pwd")),
+            condition: Condition::Always,
+            continue_on_error: false,
+        })
+        .add_step(execute_step);
+
+    Ok((blueprint, ctx))
+}
+```
+
+### TDD Blueprint
+
+Test-driven development flow for Standard tasks:
+
+```rust title="pipeline.rs:344-512"
+pub fn build_tdd_blueprint(
+    trigger: &TriggerContext,
+    config: &PipelineConfig,
+    working_dir: &str,
+) -> Result<(Blueprint, StepContext)> {
+    let mut blueprint = Blueprint::new("magpie-tdd");
+
+    // Step 1: scan-repo
+    blueprint = blueprint.add_step(Step {
+        name: "scan-repo".to_string(),
+        kind: StepKind::Shell(ShellStep::new("find").with_args(vec![/*...*/])),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 2: plan
+    blueprint = blueprint.add_step(Step {
+        name: "plan".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(format!(
+                "You are planning how to implement a task. The file tree of the repository \
+                 is provided as previous step output.\n\n\
+                 Task: {}\n\n\
+                 Create a brief plan:\n\
+                 1. Which files to modify or create\n\
+                 2. What tests to write (test names and what they verify)\n\
+                 3. Implementation approach (key functions/types to add or change)\n\n\
+                 Be concise — this plan guides the next steps.",
+                trigger.message
+            ))
+            .with_last_output()
+            .with_context_from_metadata("chat_history"),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 3: write-tests (red phase)
+    blueprint = blueprint.add_step(Step {
+        name: "write-tests".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(format!(
+                "Based on the plan from the previous step, write ONLY test code.\n\n\
+                 Task: {}\n\n\
+                 Rules:\n\
+                 - Write test functions that verify the expected behavior\n\
+                 - Do NOT implement the actual feature yet\n\
+                 - Tests should fail when run (the implementation doesn't exist yet)\n\
+                 - Use the project's existing test patterns and framework\n\
+                 - Include both happy-path and edge-case tests",
+                trigger.message
+            ))
+            .with_last_output()
+            .with_context_from_metadata("chat_history"),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 4: verify-tests-fail
+    blueprint = blueprint.add_step(Step {
+        name: "verify-tests-fail".to_string(),
+        kind: StepKind::Shell(ShellStep::new(test_cmd.clone()).with_args(test_args.clone())),
+        condition: Condition::Always,
+        continue_on_error: true, // expected to fail
+    });
+
+    // Step 5: implement (green phase)
+    blueprint = blueprint.add_step(Step {
+        name: "implement".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(format!(
+                "The tests from the previous step have been run. The output (including any \
+                 failures or compilation errors) is provided as previous step output.\n\n\
+                 Task: {}\n\n\
+                 Now write the implementation to make all tests pass.\n\
+                 - Fix any compilation errors in the tests if needed\n\
+                 - Implement the actual feature/change\n\
+                 - Make sure all tests pass",
+                trigger.message
+            ))
+            .with_last_output()
+            .with_context_from_metadata("chat_history"),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 6: run-tests
+    blueprint = blueprint.add_step(Step {
+        name: "run-tests".to_string(),
+        kind: StepKind::Shell(ShellStep::new(test_cmd).with_args(test_args)),
+        condition: Condition::Always,
+        continue_on_error: true,
+    });
+
+    // Step 7: lint-check
+    blueprint = blueprint.add_step(Step {
+        name: "lint-check".to_string(),
+        kind: StepKind::Shell(ShellStep::new(lint_cmd).with_args(lint_args)),
+        condition: Condition::Always,
+        continue_on_error: true,
+    });
+
+    Ok((blueprint, ctx))
+}
+```
+
+**Flow:**
+```
+scan-repo → plan → write-tests → verify-tests-fail → implement → run-tests → lint-check
+```
+
+<Note>
+The agent writes tests first (red), then implements the feature to make them pass (green). This is classic TDD.
+</Note>
+
+### Diagnostic Blueprint
+
+Investigate-first flow for BugFix tasks:
+
+```rust title="pipeline.rs:520-723"
+pub fn build_diagnostic_blueprint(
+    trigger: &TriggerContext,
+    config: &PipelineConfig,
+    working_dir: &str,
+) -> Result<(Blueprint, StepContext)> {
+    let mut blueprint = Blueprint::new("magpie-diagnostic");
+
+    // Step 1: scan-repo
+    blueprint = blueprint.add_step(Step {
+        name: "scan-repo".to_string(),
+        kind: StepKind::Shell(ShellStep::new("find").with_args(vec![/*...*/])),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 2: investigate (read-only)
+    blueprint = blueprint.add_step(Step {
+        name: "investigate".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(format!(
+                "You are investigating a bug. The file tree of the repository \
+                 is provided as previous step output.\n\n\
+                 Bug report: {}\n\n\
+                 Your job is to find the ROOT CAUSE. Do NOT plan a fix yet. \
+                 Do NOT modify any files.\n\n\
+                 Instructions:\n\
+                 1. Trace the data flow through the affected code path\n\
+                 2. Read the relevant source files\n\
+                 3. Identify the exact location where behavior diverges from expectation\n\
+                 4. Name the specific files, functions, and line numbers involved\n\
+                 5. Explain WHY the bug occurs (not just WHAT happens)\n\n\
+                 Output a clear investigation report with your findings.",
+                trigger.message
+            ))
+            .with_last_output()
+            .with_context_from_metadata("chat_history"),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 3: plan
+    blueprint = blueprint.add_step(Step {
+        name: "plan".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(format!(
+                "Based on the investigation findings from the previous step, \
+                 plan a targeted fix.\n\n\
+                 Bug report: {}\n\n\
+                 Create a brief plan:\n\
+                 1. What is the root cause (from investigation)\n\
+                 2. What specific changes to make and why\n\
+                 3. What regression test to write\n\n\
+                 Be concise — this plan guides the next steps.",
+                trigger.message
+            ))
+            .with_last_output()
+            .with_context_from_metadata("chat_history"),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 4: write-regression-test
+    blueprint = blueprint.add_step(Step {
+        name: "write-regression-test".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(format!(
+                "Based on the plan from the previous step, write a regression test \
+                 that REPRODUCES the bug.\n\n\
+                 Bug report: {}\n\n\
+                 Rules:\n\
+                 - The test should FAIL with the current (buggy) code\n\
+                 - It should PASS once the fix is applied\n\
+                 - Use the project's existing test patterns and framework\n\
+                 - Do NOT implement the fix yet — only the test",
+                trigger.message
+            ))
+            .with_last_output()
+            .with_context_from_metadata("chat_history"),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 5: verify-test-fails
+    blueprint = blueprint.add_step(Step {
+        name: "verify-test-fails".to_string(),
+        kind: StepKind::Shell(ShellStep::new(test_cmd.clone()).with_args(test_args.clone())),
+        condition: Condition::Always,
+        continue_on_error: true, // expected to fail
+    });
+
+    // Step 6: implement-fix
+    blueprint = blueprint.add_step(Step {
+        name: "implement-fix".to_string(),
+        kind: StepKind::Agent(
+            AgentStep::new(format!(
+                "The regression test from the previous step has been run. The output \
+                 (including failures) is provided as previous step output.\n\n\
+                 Bug report: {}\n\n\
+                 Now fix the ROOT CAUSE identified in the investigation step.\n\
+                 - Do NOT use workarounds or band-aids\n\
+                 - Fix the underlying issue, not just the symptoms\n\
+                 - Make sure the regression test passes\n\
+                 - Do not break existing tests",
+                trigger.message
+            ))
+            .with_last_output()
+            .with_context_from_metadata("chat_history"),
+        ),
+        condition: Condition::Always,
+        continue_on_error: false,
+    });
+
+    // Step 7: run-tests
+    blueprint = blueprint.add_step(Step {
+        name: "run-tests".to_string(),
+        kind: StepKind::Shell(ShellStep::new(test_cmd).with_args(test_args)),
+        condition: Condition::Always,
+        continue_on_error: true,
+    });
+
+    // Step 8: lint-check
+    blueprint = blueprint.add_step(Step {
+        name: "lint-check".to_string(),
+        kind: StepKind::Shell(ShellStep::new(lint_cmd).with_args(lint_args)),
+        condition: Condition::Always,
+        continue_on_error: true,
+    });
+
+    Ok((blueprint, ctx))
+}
+```
+
+**Flow:**
+```
+scan-repo → investigate → plan → write-regression-test → verify-test-fails → implement-fix → run-tests → lint-check
+```
+
+<Info>
+The key difference from TDD is the **investigate** step that forces the agent to trace the root cause before planning a fix. This prevents band-aid solutions.
+</Info>
+
+### Fix Blueprint
+
+Used during CI retry rounds:
+
+```rust title="pipeline.rs:295-342"
+pub fn build_fix_blueprint(
+    trigger: &TriggerContext,
+    config: &PipelineConfig,
+    test_output: &str,
+    working_dir: &str,
+) -> Result<(Blueprint, StepContext)> {
+    let fix_prompt = format!(
+        "The previous test run failed. Fix the issues and try again.\n\n\
+         Original task: {}\n\n\
+         Test output:\n```\n{}\n```",
+        trigger.message, test_output,
+    );
+
+    let fix_step = if config.dry_run {
+        Step {
+            name: "agent-fix".to_string(),
+            kind: StepKind::Shell(
+                ShellStep::new("echo")
+                    .with_args(vec![format!("dry-run: fix for {}", trigger.message)]),
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        }
+    } else {
+        Step {
+            name: "agent-fix".to_string(),
+            kind: StepKind::Agent(
+                AgentStep::new(&fix_prompt).with_context_from_metadata("chat_history"),
+            ),
+            condition: Condition::Always,
+            continue_on_error: false,
+        }
+    };
+
+    let blueprint = Blueprint::new("magpie-fix").add_step(fix_step);
+
+    Ok((blueprint, ctx))
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Flow" icon="route" href="/concepts/pipeline">
+    See how blueprints fit into the full pipeline
+  </Card>
+  <Card title="Sandbox Abstraction" icon="box" href="/concepts/sandbox">
+    Understand where Shell and Agent steps execute
+  </Card>
+</CardGroup>

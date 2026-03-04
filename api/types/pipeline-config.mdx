@@ -1,0 +1,217 @@
+---
+title: "PipelineConfig"
+description: "Configuration for a Magpie pipeline run"
+---
+
+## Overview
+
+`PipelineConfig` defines all parameters needed to execute a Magpie pipeline. Each adapter (CLI, Discord, Teams) builds a config from environment variables and passes it to `run_pipeline()`.
+
+Defined in `crates/magpie-core/src/pipeline.rs:26-48`.
+
+## Struct Definition
+
+```rust
+pub struct PipelineConfig {
+    pub repo_dir: PathBuf,
+    pub base_branch: String,
+    pub test_command: String,
+    pub lint_command: String,
+    pub max_ci_rounds: u32,
+    pub plane: Option<PlaneConfig>,
+    pub dry_run: bool,
+    pub github_org: Option<String>,
+    pub trace_dir: Option<PathBuf>,
+    pub daytona: Option<DaytonaConfig>,
+    #[cfg(feature = "daytona")]
+    pub pool: Option<Arc<crate::sandbox::pool::WarmPool>>,
+}
+```
+
+## Fields
+
+<ResponseField name="repo_dir" type="PathBuf" required>
+  Directory containing the target repository. Used directly when `github_org` is `None`. When `github_org` is set, this serves as a fallback for dry-run mode.
+  
+  **Default:** `.` (current directory)
+</ResponseField>
+
+<ResponseField name="base_branch" type="String" required>
+  The main branch to branch from and merge PRs into (e.g. `main`, `master`, `develop`).
+  
+  **Default:** `"main"`
+</ResponseField>
+
+<ResponseField name="test_command" type="String" required>
+  Shell command to run tests. Used in CI loops and blueprint test phases.
+  
+  **Default:** `"cargo test"`
+  
+  **Example:** `"npm test"`, `"pytest"`, `"cargo test --workspace"`
+</ResponseField>
+
+<ResponseField name="lint_command" type="String" required>
+  Shell command to run linter. Executed after tests in CI phase.
+  
+  **Default:** `"cargo clippy"`
+  
+  **Example:** `"eslint ."`, `"cargo clippy -- -D warnings"`
+</ResponseField>
+
+<ResponseField name="max_ci_rounds" type="u32" required>
+  Maximum number of CI retry rounds. Each round runs lint + test, and on failure, the agent gets another chance to fix issues.
+  
+  **Default:** `2`
+  
+  **Note:** For TDD/Diagnostic blueprints, the first test+lint runs inside the blueprint. If those pass, the CI loop is skipped entirely.
+</ResponseField>
+
+<ResponseField name="plane" type="Option<PlaneConfig>">
+  Optional Plane.so integration config. When set, Magpie creates issues and updates them with PR links.
+  
+  **Default:** `None`
+</ResponseField>
+
+<ResponseField name="dry_run" type="bool" required>
+  When `true`, agent steps are replaced with shell echo stubs. Useful for testing pipeline orchestration without running the full LLM.
+  
+  **Default:** `false`
+</ResponseField>
+
+<ResponseField name="github_org" type="Option<String>">
+  GitHub organization to restrict repo access to. When set:
+  - Pipeline parses the repo name from the task message (e.g. "in magpie-core" → `<org>/magpie-core`)
+  - Validates the repo belongs to this org
+  - Clones the repo into a fresh sandbox
+  
+  When `None`, `repo_dir` is used directly (static single-repo mode).
+  
+  **Default:** `None`
+  
+  **Example:** `"anomalyco"`, `"my-company"`
+</ResponseField>
+
+<ResponseField name="trace_dir" type="Option<PathBuf>">
+  Directory for JSONL trace files. When set, all agent calls (both Tier 1 `claude_call()` and Tier 2 `MagpieAgent`) write structured logs.
+  
+  **Default:** `None`
+  
+  **Usage:** CLI `--trace` flag sets this to a timestamped directory.
+</ResponseField>
+
+<ResponseField name="daytona" type="Option<DaytonaConfig>">
+  When set, pipeline runs execute inside a Daytona sandbox (remote environment). If `None`, commands execute locally.
+  
+  **Default:** `None`
+  
+  **Feature:** Requires `daytona` feature flag
+</ResponseField>
+
+<ResponseField name="pool" type="Option<Arc<WarmPool>>">
+  Warm sandbox pool. When set, the pipeline tries to acquire a pre-built sandbox before falling back to cold creation.
+  
+  **Default:** `None`
+  
+  **Feature:** Only available with `daytona` feature flag
+  
+  **Note:** This is an optimization for faster startup times in multi-repo environments.
+</ResponseField>
+
+## Default Configuration
+
+```rust
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            repo_dir: PathBuf::from("."),
+            base_branch: "main".to_string(),
+            test_command: "cargo test".to_string(),
+            lint_command: "cargo clippy".to_string(),
+            max_ci_rounds: 2,
+            plane: None,
+            dry_run: false,
+            github_org: None,
+            trace_dir: None,
+            daytona: None,
+            #[cfg(feature = "daytona")]
+            pool: None,
+        }
+    }
+}
+```
+
+## Usage Example
+
+### CLI Adapter (Single Repo)
+
+```rust
+use magpie_core::pipeline::{PipelineConfig, run_pipeline};
+use std::path::PathBuf;
+
+let config = PipelineConfig {
+    repo_dir: PathBuf::from("/path/to/repo"),
+    base_branch: "main".to_string(),
+    test_command: "cargo test".to_string(),
+    lint_command: "cargo clippy -- -D warnings".to_string(),
+    max_ci_rounds: 3,
+    dry_run: false,
+    trace_dir: Some(PathBuf::from("/tmp/traces")),
+    ..Default::default()
+};
+
+let result = run_pipeline(
+    &platform,
+    "channel-123",
+    "alice",
+    "add health check endpoint",
+    &config,
+)
+.await?;
+```
+
+### Discord Bot (Multi-Repo)
+
+```rust
+let config = PipelineConfig {
+    base_branch: "main".to_string(),
+    test_command: "cargo test".to_string(),
+    lint_command: "cargo clippy".to_string(),
+    max_ci_rounds: 2,
+    github_org: Some("my-company".to_string()),
+    plane: Some(plane_config),
+    ..Default::default()
+};
+
+// Task: "add logging to magpie-core"
+// Pipeline will:
+// 1. Parse "magpie-core" from message
+// 2. Validate it's in "my-company" org
+// 3. Clone my-company/magpie-core into a fresh sandbox
+// 4. Run agent on the task
+// 5. Open PR
+```
+
+### Testing with Dry Run
+
+```rust
+let config = PipelineConfig {
+    dry_run: true,
+    max_ci_rounds: 1,
+    ..Default::default()
+};
+
+// Agent steps become shell echoes:
+// AgentStep("implement feature") → ShellStep("echo", ["dry-run: implement feature"])
+```
+
+## Notes
+
+- **Thread Safety:** Config is `Clone` and can be shared across threads. The `pool` field uses `Arc` for shared ownership.
+- **Validation:** The pipeline validates `github_org` constraints at runtime and returns `PipelineStatus::SetupFailed` if repo parsing fails.
+- **CI Optimization:** TDD and Diagnostic blueprints run tests internally. If those pass, `max_ci_rounds` is effectively skipped (starts at round N+1).
+
+## See Also
+
+- [PipelineResult](/api/types/pipeline-result) — Return value of `run_pipeline()`
+- [TaskComplexity](/api/types/task-complexity) — Classification that determines blueprint selection
+- [Blueprint](/api/types/blueprint) — Orchestration structure executed by the pipeline

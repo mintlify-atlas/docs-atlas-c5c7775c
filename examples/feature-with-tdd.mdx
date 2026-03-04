@@ -1,0 +1,401 @@
+---
+title: 'Feature with TDD Blueprint'
+description: 'Example of a feature request flowing through the TDD blueprint with test-driven development'
+icon: 'flask'
+---
+
+## Overview
+
+Standard-complexity tasks like new features, refactors, and integrations flow through Magpie's **TDD blueprint** (`magpie-tdd`). This structured approach follows test-driven development: scan → plan → write tests → verify fail → implement → test → lint.
+
+## Task Classification
+
+Keywords that trigger the Standard path:
+
+- `add`, `implement`, `create`, `build`, `refactor`
+- `migrate`, `integrate`, `introduce`, `design`, `architect`
+- `extract`, `replace`, `rewrite`, `optimize`, `convert`
+
+## Example: Add Health Check Endpoint
+
+### Discord Message
+
+```
+@magpie add a /health endpoint to the API that returns JSON with:
+- status: "ok"
+- uptime: seconds since server start
+- version: from Cargo.toml
+
+Should return 200 OK
+```
+
+### Pipeline Flow
+
+<Steps>
+  <Step title="Task Classification">
+    Magpie detects the keyword `"add"` and classifies this as **Standard**.
+    
+    ```
+    [INFO] task="add a /health endpoint..." classified as Standard (keyword match)
+    ```
+  </Step>
+
+  <Step title="Branch Creation">
+    Tier 1 Claude generates a descriptive branch slug:
+    
+    ```bash
+    claude -p "Generate a 3-6 word git branch slug for this task..."
+    # Output: add-health-endpoint
+    
+    git checkout -b magpie/add-health-endpoint
+    ```
+  </Step>
+
+  <Step title="TDD Blueprint Step 1: scan-repo">
+    The blueprint starts by scanning the repository structure:
+    
+    ```bash
+    find /workspace/magpie -type f \
+      -not -path '*/.git/*' \
+      -not -path '*/target/*' \
+      -not -path '*/node_modules/*'
+    ```
+    
+    Output (truncated):
+    ```
+    /workspace/magpie/Cargo.toml
+    /workspace/magpie/crates/magpie-core/src/lib.rs
+    /workspace/magpie/crates/magpie-core/src/pipeline.rs
+    /workspace/magpie/crates/magpie-discord/src/main.rs
+    /workspace/magpie/crates/magpie-teams/src/main.rs
+    /workspace/magpie/crates/magpie-cli/src/main.rs
+    ...
+    ```
+  </Step>
+
+  <Step title="TDD Blueprint Step 2: plan">
+    Agent receives the file tree and creates a structured plan:
+    
+    **Agent Prompt:**
+    ```
+    You are planning how to implement a task. The file tree of the 
+    repository is provided as previous step output.
+    
+    Task: add a /health endpoint to the API that returns JSON with...
+    
+    Create a brief plan:
+    1. Which files to modify or create
+    2. What tests to write (test names and what they verify)
+    3. Implementation approach (key functions/types to add or change)
+    ```
+    
+    **Agent Output:**
+    ```
+    Plan for /health endpoint:
+    
+    1. Files to modify:
+       - crates/magpie-teams/src/main.rs (Axum routes)
+       - crates/magpie-teams/Cargo.toml (add chrono for uptime)
+    
+    2. Tests to write:
+       - test_health_endpoint_returns_200()
+       - test_health_json_structure() — validates status, uptime, version fields
+       - test_health_uptime_increases() — call twice, verify uptime grows
+    
+    3. Implementation:
+       - Add static START_TIME: Lazy<Instant>
+       - Create health_handler() async fn returning Json<HealthResponse>
+       - Add GET /health route to Axum router
+       - HealthResponse struct with status, uptime_seconds, version
+       - Read version from CARGO_PKG_VERSION env at compile time
+    ```
+  </Step>
+
+  <Step title="TDD Blueprint Step 3: write-tests">
+    Agent writes test code ONLY (no implementation yet):
+    
+    **Agent Prompt:**
+    ```
+    Based on the plan from the previous step, write ONLY test code.
+    
+    Rules:
+    - Write test functions that verify the expected behavior
+    - Do NOT implement the actual feature yet
+    - Tests should fail when run (the implementation doesn't exist yet)
+    - Use the project's existing test patterns and framework
+    ```
+    
+    **Agent Output:**
+    ```rust
+    // crates/magpie-teams/src/main.rs (added to #[cfg(test)] mod tests)
+    
+    #[tokio::test]
+    async fn test_health_endpoint_returns_200() {
+        let app = create_app();
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    
+    #[tokio::test]
+    async fn test_health_json_structure() {
+        let app = create_app();
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        
+        let body_bytes = to_bytes(resp.into_body()).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        
+        assert_eq!(json["status"], "ok");
+        assert!(json["uptime_seconds"].is_number());
+        assert!(json["version"].is_string());
+    }
+    
+    #[tokio::test]
+    async fn test_health_uptime_increases() {
+        let app = create_app();
+        
+        let resp1 = app.clone().oneshot(
+            Request::builder().uri("/health").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        let body1 = to_bytes(resp1.into_body()).await.unwrap();
+        let json1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        let uptime1 = json1["uptime_seconds"].as_u64().unwrap();
+        
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        
+        let resp2 = app.oneshot(
+            Request::builder().uri("/health").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        let body2 = to_bytes(resp2.into_body()).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        let uptime2 = json2["uptime_seconds"].as_u64().unwrap();
+        
+        assert!(uptime2 >= uptime1 + 2);
+    }
+    ```
+    
+    Agent confirms:
+    ```
+    Tests written. Created 3 test functions:
+    - test_health_endpoint_returns_200
+    - test_health_json_structure
+    - test_health_uptime_increases
+    
+    These will fail until the /health endpoint is implemented.
+    ```
+  </Step>
+
+  <Step title="TDD Blueprint Step 4: verify-tests-fail">
+    Run tests to confirm they fail (TDD red phase):
+    
+    ```bash
+    cargo test
+    ```
+    
+    Output:
+    ```
+    running 3 tests
+    test test_health_endpoint_returns_200 ... FAILED
+    test test_health_json_structure ... FAILED
+    test test_health_uptime_increases ... FAILED
+    
+    failures:
+        test_health_endpoint_returns_200
+        test_health_json_structure
+        test_health_uptime_increases
+    
+    error: aborting due to previous error
+    
+    [INFO] step="verify-tests-fail" exit_code=101 (expected failure)
+    ```
+    
+    The blueprint continues because `continue_on_error: true` for this step.
+  </Step>
+
+  <Step title="TDD Blueprint Step 5: implement">
+    Agent implements the feature to make tests pass:
+    
+    **Agent Prompt:**
+    ```
+    The tests from the previous step have been run. The output (including 
+    any failures or compilation errors) is provided as previous step output.
+    
+    Task: add a /health endpoint...
+    
+    Now write the implementation to make all tests pass.
+    - Fix any compilation errors in the tests if needed
+    - Implement the actual feature/change
+    - Make sure all tests pass
+    ```
+    
+    **Agent Output:**
+    ```rust
+    // crates/magpie-teams/Cargo.toml
+    [dependencies]
+    chrono = "0.4"
+    once_cell = "1.19"
+    
+    // crates/magpie-teams/src/main.rs
+    use axum::{Json, response::IntoResponse, routing::get};
+    use once_cell::sync::Lazy;
+    use serde::Serialize;
+    use std::time::Instant;
+    
+    static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
+    
+    #[derive(Serialize)]
+    struct HealthResponse {
+        status: String,
+        uptime_seconds: u64,
+        version: String,
+    }
+    
+    async fn health_handler() -> impl IntoResponse {
+        let uptime = START_TIME.elapsed().as_secs();
+        Json(HealthResponse {
+            status: "ok".to_string(),
+            uptime_seconds: uptime,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+    
+    fn create_app() -> Router {
+        Router::new()
+            .route("/health", get(health_handler))
+            .route("/webhooks/teams", post(teams_webhook_handler))
+    }
+    ```
+    
+    Agent confirms:
+    ```
+    Implementation complete:
+    - Added START_TIME static to track server start time
+    - Created HealthResponse struct with required fields
+    - Implemented health_handler() that returns JSON
+    - Added GET /health route to Axum router
+    - Version read from CARGO_PKG_VERSION at compile time
+    ```
+  </Step>
+
+  <Step title="TDD Blueprint Step 6: run-tests">
+    Run tests again, expecting pass (TDD green phase):
+    
+    ```bash
+    cargo test
+    ```
+    
+    Output:
+    ```
+    running 3 tests
+    test test_health_endpoint_returns_200 ... ok
+    test test_health_json_structure ... ok
+    test test_health_uptime_increases ... ok
+    
+    test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
+    
+    [INFO] step="run-tests" exit_code=0 tests passed
+    ```
+  </Step>
+
+  <Step title="TDD Blueprint Step 7: lint-check">
+    ```bash
+    cargo clippy -- -D warnings
+    ```
+    
+    Output:
+    ```
+    Checking magpie-teams v0.1.0
+    Finished dev [unoptimized + debuginfo] target(s) in 3.21s
+    
+    [INFO] step="lint-check" exit_code=0 lint passed
+    ```
+  </Step>
+
+  <Step title="CI Classification">
+    Magpie checks changed files:
+    
+    ```
+    [INFO] file_count=2 files=["crates/magpie-teams/src/main.rs", 
+           "crates/magpie-teams/Cargo.toml"] code changes detected → running CI
+    ```
+    
+    Because the TDD blueprint's built-in test+lint steps already passed, 
+    Magpie **skips the CI loop entirely**.
+    
+    ```
+    [INFO] TDD tests+lint passed inside blueprint — skipping CI round 1
+    ```
+  </Step>
+
+  <Step title="Commit & PR">
+    Tier 1 Claude generates commit message:
+    
+    ```bash
+    claude -p "Generate a conventional commit message from this diff..."
+    # Output: feat: add /health endpoint with status, uptime, and version
+    ```
+    
+    Git operations:
+    ```bash
+    git add crates/magpie-teams/src/main.rs crates/magpie-teams/Cargo.toml
+    git commit -m "feat: add /health endpoint with status, uptime, and version"
+    git push -u origin magpie/add-health-endpoint
+    gh pr create --title "Add /health endpoint" \
+      --body "Adds GET /health endpoint returning JSON with status, uptime, and version."
+    ```
+    
+    PR URL: `https://github.com/org/magpie/pull/143`
+  </Step>
+</Steps>
+
+## Pipeline Result
+
+```json
+{
+  "output": "Implementation complete: Added /health endpoint with status, uptime, and version fields.",
+  "pr_url": "https://github.com/org/magpie/pull/143",
+  "plane_issue_id": "MAGPIE-43",
+  "ci_passed": true,
+  "rounds_used": 1,
+  "status": "Success"
+}
+```
+
+## Discord Bot Reply
+
+```
+✅ Done!
+
+PR: https://github.com/org/magpie/pull/143
+Branch: magpie/add-health-endpoint
+CI: Passed (1 round)
+Plane: MAGPIE-43
+
+Tests: 3 passed
+```
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Total time | ~15 minutes |
+| Agent turns | ~8-12 (scan, plan, write tests, implement) |
+| CI rounds | 0 (TDD lint+test already passed) |
+| Tier 1 calls | 2 (branch slug, commit message) |
+| Tier 2 calls | 4 (plan, write-tests, implement, investigate) |
+
+## Why TDD Works
+
+1. **Structured phases** — agent doesn't try to do everything at once
+2. **Test-first** — validates behavior before implementation
+3. **Built-in CI** — lint+test run inside the blueprint
+4. **No wasted retries** — if TDD tests pass, skip external CI loop
+
+TDD tasks take ~15 minutes but produce higher-quality code with test coverage.

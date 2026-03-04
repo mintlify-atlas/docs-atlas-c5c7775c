@@ -1,0 +1,478 @@
+---
+title: 'Deploying the Teams Bot'
+description: 'Deploy Magpie as a Microsoft Teams bot using Bot Framework webhooks'
+icon: 'microsoft'
+---
+
+The Teams bot adapter receives Bot Framework webhook events and triggers Magpie pipelines from Microsoft Teams messages. The bot uses OAuth2 for authentication and HMAC for webhook validation.
+
+## Prerequisites
+
+Before deploying the Teams bot, ensure you have:
+
+- **Rust 1.75+** installed via [rustup](https://rustup.rs/)
+- **Claude CLI** configured (required for both Tier 1 and Tier 2 LLM operations)
+- **GitHub CLI** (`gh`) authenticated for creating PRs
+- **Azure account** for Bot Framework registration
+- **Git** for cloning repositories
+- **Public endpoint** for webhook (or ngrok for local testing)
+
+## Registering a Bot Framework Application
+
+<Steps>
+  <Step title="Create Azure Bot Registration">
+    1. Log in to the [Azure Portal](https://portal.azure.com)
+    2. Search for **Azure Bot** and create a new resource
+    3. Choose **Bot Channels Registration** (or **Multi-tenant** bot)
+    4. Fill in:
+       - Bot handle: unique name (e.g., `magpie-bot`)
+       - Subscription: your Azure subscription
+       - Resource group: create or select existing
+       - Pricing tier: F0 (free) for testing
+  </Step>
+
+  <Step title="Get App Credentials">
+    After creation:
+    
+    1. Navigate to **Configuration** in your bot resource
+    2. Copy the **Microsoft App ID** (this is `TEAMS_APP_ID`)
+    3. Click **Manage** next to the App ID to go to App Registrations
+    4. In **Certificates & secrets**, create a **New client secret**
+    5. Copy the secret **Value** immediately (this is `TEAMS_APP_SECRET`)
+    
+    <Warning>
+      The client secret value is only shown once. Store it securely.
+    </Warning>
+  </Step>
+
+  <Step title="Configure Messaging Endpoint">
+    In the Azure Bot **Configuration** page:
+    
+    1. Set **Messaging endpoint** to your public webhook URL:
+       ```
+       https://your-domain.com/api/messages
+       ```
+    2. For local testing with ngrok:
+       ```bash
+       ngrok http 3978
+       # Use the ngrok HTTPS URL: https://abc123.ngrok.io/api/messages
+       ```
+    3. Save the configuration
+  </Step>
+
+  <Step title="Add Microsoft Teams Channel">
+    1. In your Azure Bot, go to **Channels**
+    2. Click on the **Microsoft Teams** icon
+    3. Accept the terms and click **Save**
+    4. The Teams channel is now enabled
+  </Step>
+
+  <Step title="Install Bot in Teams">
+    1. In Channels, click **Microsoft Teams** to open configuration
+    2. Click **Open in Teams** to install the bot
+    3. Or create an app package using App Studio in Teams
+  </Step>
+</Steps>
+
+## Environment Configuration
+
+The Teams bot requires several environment variables. Create a `.env` file or set them in your deployment environment:
+
+### Required Variables
+
+```bash
+# Bot Framework credentials (from Azure portal)
+TEAMS_APP_ID=your-app-id-from-azure
+TEAMS_APP_SECRET=your-app-secret-from-azure
+
+# Webhook server address
+TEAMS_LISTEN_ADDR=0.0.0.0:3978        # Default: 0.0.0.0:3978
+```
+
+### Optional: HMAC Validation
+
+```bash
+# Secure webhook with HMAC-SHA256 signature validation
+TEAMS_HMAC_SECRET=your-random-secret-key
+```
+
+<Note>
+  HMAC validation is optional but recommended for production. If set, incoming webhooks must include a valid `Authorization: HMAC <signature>` header.
+</Note>
+
+### Pipeline Configuration
+
+```bash
+# Repository settings
+MAGPIE_REPO_DIR=.                    # Path to git repo (default: current directory)
+MAGPIE_BASE_BRANCH=main              # Base branch for PRs (default: main)
+
+# CI Commands
+MAGPIE_TEST_CMD="cargo test"         # Test command for CI loop
+MAGPIE_LINT_CMD="cargo clippy"       # Lint command for CI loop
+MAGPIE_MAX_CI_ROUNDS=2               # Max CI retry rounds (default: 2)
+
+# GitHub Organization (optional — enables multi-repo support)
+MAGPIE_GITHUB_ORG=your-org-name      # Restrict to specific GitHub org
+```
+
+### Optional: Plane Issue Tracking
+
+```bash
+# Self-hosted Plane integration for automatic issue creation
+PLANE_BASE_URL=https://plane.yourcompany.com
+PLANE_API_KEY=your-plane-api-key
+PLANE_WORKSPACE_SLUG=your-workspace
+PLANE_PROJECT_ID=project-uuid
+```
+
+### Optional: Daytona Sandbox
+
+```bash
+# Use remote Daytona sandboxes instead of local execution
+DAYTONA_API_KEY=your-daytona-api-key
+DAYTONA_BASE_URL=https://app.daytona.io/api
+DAYTONA_ORGANIZATION_ID=your-org-id
+DAYTONA_SANDBOX_CLASS=small          # small | medium | large
+DAYTONA_SNAPSHOT_NAME=magpie-devbox  # Pre-configured snapshot
+DAYTONA_ENV="KEY1=val1,KEY2=val2"    # Additional env vars for sandbox
+```
+
+## Building and Running
+
+<Steps>
+  <Step title="Build the Teams Bot">
+    Build the `magpie-teams` binary from the workspace root:
+    
+    ```bash
+    cargo build --release -p magpie-teams
+    ```
+    
+    The compiled binary will be at `target/release/magpie-teams`.
+    
+    <Note>
+      First build takes 4-5 minutes due to transitive dependencies (Goose, candle, tree-sitter, etc.).
+    </Note>
+  </Step>
+
+  <Step title="Run the Webhook Server Locally">
+    Set your environment variables and run:
+    
+    ```bash
+    # Load .env file
+    export $(cat .env | xargs)
+    
+    # Run the webhook server
+    cargo run --release -p magpie-teams
+    ```
+    
+    Or run the compiled binary directly:
+    
+    ```bash
+    TEAMS_APP_ID=your-id TEAMS_APP_SECRET=your-secret ./target/release/magpie-teams
+    ```
+    
+    You should see:
+    ```
+    INFO magpie-teams listening on 0.0.0.0:3978
+    ```
+  </Step>
+
+  <Step title="Expose Local Server (for testing)">
+    If testing locally, use ngrok to expose your webhook:
+    
+    ```bash
+    ngrok http 3978
+    ```
+    
+    Update your Azure Bot's messaging endpoint to the ngrok HTTPS URL:
+    ```
+    https://abc123.ngrok.io/api/messages
+    ```
+  </Step>
+
+  <Step title="Test the Bot in Teams">
+    In Microsoft Teams:
+    
+    1. Open a chat with your bot or mention it in a channel
+    2. Send a message: `@Magpie add a health check endpoint`
+    3. The bot will reply with "Working on it..."
+    4. After the pipeline completes, you'll receive a status message with:
+       - Pipeline status (Success/PartialSuccess/Failed)
+       - PR URL (if created)
+       - Plane issue ID (if configured)
+       - CI status
+  </Step>
+</Steps>
+
+## Production Deployment
+
+### Azure App Service
+
+Deploy the Teams bot to Azure App Service for production:
+
+<Steps>
+  <Step title="Create App Service">
+    ```bash
+    az webapp create \
+      --name magpie-teams \
+      --resource-group your-rg \
+      --plan your-plan \
+      --runtime "DOTNETCORE:8.0"  # Or custom container
+    ```
+  </Step>
+
+  <Step title="Set Environment Variables">
+    ```bash
+    az webapp config appsettings set \
+      --name magpie-teams \
+      --resource-group your-rg \
+      --settings \
+        TEAMS_APP_ID="your-app-id" \
+        TEAMS_APP_SECRET="your-secret" \
+        MAGPIE_REPO_DIR="/home/site/repo"
+    ```
+  </Step>
+
+  <Step title="Deploy via GitHub Actions">
+    Use GitHub Actions to build and deploy:
+    
+    ```yaml
+    name: Deploy Teams Bot
+    on:
+      push:
+        branches: [main]
+    
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v3
+          - uses: dtolnay/rust-toolchain@stable
+          - run: cargo build --release -p magpie-teams
+          - uses: azure/webapps-deploy@v2
+            with:
+              app-name: magpie-teams
+              publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+              package: target/release/magpie-teams
+    ```
+  </Step>
+
+  <Step title="Update Messaging Endpoint">
+    Set your Azure Bot's messaging endpoint to:
+    ```
+    https://magpie-teams.azurewebsites.net/api/messages
+    ```
+  </Step>
+</Steps>
+
+### Running as a Systemd Service
+
+For VM-based deployments, create a systemd service file at `/etc/systemd/system/magpie-teams.service`:
+
+```ini
+[Unit]
+Description=Magpie Teams Webhook
+After=network.target
+
+[Service]
+Type=simple
+User=magpie
+WorkingDirectory=/opt/magpie
+EnvironmentFile=/opt/magpie/.env
+ExecStart=/opt/magpie/magpie-teams
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable magpie-teams
+sudo systemctl start magpie-teams
+sudo systemctl status magpie-teams
+```
+
+### Docker Deployment
+
+See the [Docker Setup Guide](/guides/docker-setup) for containerized deployment options.
+
+### Reverse Proxy with NGINX
+
+For production, place NGINX in front of the webhook server:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name magpie.yourcompany.com;
+    
+    ssl_certificate /etc/ssl/certs/magpie.crt;
+    ssl_certificate_key /etc/ssl/private/magpie.key;
+    
+    location /api/messages {
+        proxy_pass http://127.0.0.1:3978;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    
+    location /health {
+        proxy_pass http://127.0.0.1:3978;
+    }
+}
+```
+
+## Architecture
+
+The Teams bot implements the `ChatPlatform` trait from `magpie-core`:
+
+- **Webhook Server**: Axum HTTP server listening on port 3978 (Bot Framework standard)
+- **HMAC Validation**: Optional signature verification using `TEAMS_HMAC_SECRET`
+- **OAuth2 Authentication**: Token caching with 5-minute expiry buffer
+- **Async Pipeline**: Spawns pipeline in background, sends immediate acknowledgment
+- **Mention Stripping**: Removes `<at>...</at>` tags from Teams messages
+
+### Key Files
+
+| File | Purpose |
+|------|----------|
+| `crates/magpie-teams/src/main.rs:32` | Reads credentials and starts Axum server |
+| `crates/magpie-teams/src/webhook.rs:75` | Webhook handler with HMAC validation |
+| `crates/magpie-teams/src/auth.rs:50` | OAuth2 token manager with caching |
+| `crates/magpie-teams/src/adapter.rs` | `ChatPlatform` implementation for Teams |
+| `crates/magpie-teams/src/reply.rs` | Formats pipeline results for Teams |
+
+### Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|----------|
+| `/api/messages` | POST | Bot Framework webhook (main entry point) |
+| `/health` | GET | Health check endpoint (returns "ok") |
+
+### OAuth2 Flow
+
+The bot uses client credentials OAuth2 flow:
+
+1. On first message, requests token from `login.microsoftonline.com/botframework.com/oauth2/v2.0/token`
+2. Caches token with expiry (default: 3600s minus 300s buffer)
+3. Reuses cached token for subsequent API calls
+4. Automatically refreshes when expired
+
+### HMAC Signature Validation
+
+When `TEAMS_HMAC_SECRET` is configured:
+
+```python
+# Bot Framework signs request body with HMAC-SHA256
+hmac_signature = base64(hmac_sha256(secret, body))
+
+# Include in Authorization header
+Authorization: HMAC <hmac_signature>
+```
+
+The webhook handler validates this signature at `webhook.rs:46` before processing.
+
+## Troubleshooting
+
+### Bot doesn't respond to messages
+
+<AccordionGroup>
+  <Accordion title="Check messaging endpoint">
+    Verify your Azure Bot's messaging endpoint is correct and publicly accessible:
+    ```bash
+    curl -X POST https://your-domain.com/api/messages -d '{}'
+    # Should return 200 OK
+    ```
+  </Accordion>
+  
+  <Accordion title="Verify App credentials">
+    Test OAuth2 token acquisition:
+    ```bash
+    curl -X POST https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token \
+      -d "grant_type=client_credentials" \
+      -d "client_id=YOUR_APP_ID" \
+      -d "client_secret=YOUR_SECRET" \
+      -d "scope=https://api.botframework.com/.default"
+    ```
+  </Accordion>
+  
+  <Accordion title="Check server logs">
+    Run with verbose logging:
+    ```bash
+    RUST_LOG=info cargo run -p magpie-teams
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### HMAC validation fails
+
+<AccordionGroup>
+  <Accordion title="Verify secret matches">
+    Ensure `TEAMS_HMAC_SECRET` matches the secret used to sign requests.
+  </Accordion>
+  
+  <Accordion title="Check signature format">
+    Bot Framework sends: `Authorization: HMAC <base64_signature>`
+    
+    The webhook strips the "HMAC " prefix before validation.
+  </Accordion>
+  
+  <Accordion title="Disable HMAC for testing">
+    Remove `TEAMS_HMAC_SECRET` from environment to skip validation during debugging.
+  </Accordion>
+</AccordionGroup>
+
+### OAuth2 token errors
+
+<AccordionGroup>
+  <Accordion title="401 Unauthorized">
+    App ID or secret is incorrect. Verify credentials in Azure Portal.
+  </Accordion>
+  
+  <Accordion title="Token expired">
+    The auth manager automatically refreshes tokens. If you see this repeatedly, check system clock sync.
+  </Accordion>
+</AccordionGroup>
+
+### Pipeline fails immediately
+
+<AccordionGroup>
+  <Accordion title="Verify Claude CLI is configured">
+    Test the Claude CLI:
+    ```bash
+    claude -p "test" "say hello"
+    ```
+  </Accordion>
+  
+  <Accordion title="Check GitHub CLI authentication">
+    ```bash
+    gh auth status
+    ```
+  </Accordion>
+  
+  <Accordion title="Verify repository access">
+    Ensure `MAGPIE_REPO_DIR` points to a valid git repository with remote configured.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Docker Setup" icon="docker" href="/guides/docker-setup">
+    Containerize the Teams bot for easier deployment
+  </Card>
+  <Card title="Pipeline Configuration" icon="gear" href="/configuration/pipeline">
+    Learn about all available pipeline settings
+  </Card>
+  <Card title="Blueprint Engine" icon="sitemap" href="/blueprints/overview">
+    Understand how Magpie orchestrates agent tasks
+  </Card>
+  <Card title="Azure Deployment" icon="microsoft" href="/guides/docker-setup">
+    Deploy to Azure App Service or Container Instances
+  </Card>
+</CardGroup>

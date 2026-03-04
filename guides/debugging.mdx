@@ -1,0 +1,521 @@
+---
+title: Debugging Guide
+description: Tools and techniques for debugging Magpie pipelines
+---
+
+## Overview
+
+Magpie provides several debugging tools to help you understand what's happening during pipeline execution, diagnose issues, and trace agent behavior.
+
+## The --trace Flag
+
+The `--trace` flag is your primary debugging tool. It enables detailed tracing of agent calls with real-time output and JSONL logs.
+
+### Enabling Trace Mode
+
+```bash
+# CLI with tracing
+cargo run -p magpie-cli -- --trace --pipeline "add a health check"
+
+# Short prompt with tracing
+cargo run -p magpie-cli -- --trace "your prompt"
+```
+
+### What --trace Does
+
+When `--trace` is enabled:
+
+1. **Real-time stderr output** — See what the agent is doing as it happens
+2. **JSONL trace files** — Detailed logs written to `.magpie/traces/magpie-trace-YYYY-MM-DD.jsonl`
+3. **Event classification** — Each agent event is categorized (CALL, TEXT, TOOL_REQ, DONE)
+
+### Stderr Output Format
+
+When tracing is enabled, you'll see real-time output like:
+
+```
+[step-name] CALL: What is the current directory structure?
+[step-name] TEXT: The current directory contains...
+[step-name] TOOL_REQ: ls -la
+[step-name] TOOL_RESP: total 48
+drwxr-xr-x  12 user  staff   384 Jan 15 10:30 .
+drwxr-xr-x   5 user  staff   160 Jan 15 10:25 ..
+...
+[step-name] TEXT: Based on the directory structure...
+[step-name] DONE: (500ms, 1 tool calls)
+```
+
+### Event Types
+
+| Event | Description |
+|-------|-------------|
+| `CALL:` | Agent call started with this prompt |
+| `TEXT:` | Agent generated text output |
+| `TOOL_REQ:` | Agent requested a tool call (file edit, shell command) |
+| `TOOL_RESP:` | Tool execution result |
+| `DONE:` | Agent call completed (duration, tool count) |
+
+## JSONL Trace Files
+
+### Location
+
+Trace files are written to:
+
+```
+.magpie/traces/magpie-trace-YYYY-MM-DD.jsonl
+```
+
+Each line is a complete JSON object representing one agent call.
+
+### Trace File Structure
+
+```json
+{
+  "started_at": 1704067200000,
+  "step_name": "implement",
+  "prompt_preview": "Write the implementation for the health check endpoint...",
+  "events": [
+    {
+      "kind": "Text",
+      "content": "I'll implement the health check endpoint.",
+      "elapsed_ms": 100
+    },
+    {
+      "kind": "ToolRequest",
+      "content": "edit_file(path='src/main.rs', ...)",
+      "elapsed_ms": 150
+    },
+    {
+      "kind": "ToolResponse",
+      "content": "File updated successfully",
+      "elapsed_ms": 200
+    }
+  ],
+  "response_preview": "I've implemented the health check endpoint at /health...",
+  "duration_ms": 2500,
+  "tool_call_count": 3
+}
+```
+
+### Analyzing Trace Files
+
+You can analyze trace files using command-line tools:
+
+```bash
+# View all traces from today
+cat .magpie/traces/magpie-trace-$(date +%Y-%m-%d).jsonl | jq .
+
+# Find slow agent calls (>5 seconds)
+cat .magpie/traces/*.jsonl | jq 'select(.duration_ms > 5000)'
+
+# Count tool calls per step
+cat .magpie/traces/*.jsonl | jq '{step: .step_name, tools: .tool_call_count}'
+
+# Extract all prompts
+cat .magpie/traces/*.jsonl | jq -r '.prompt_preview'
+
+# Find errors in traces
+cat .magpie/traces/*.jsonl | jq 'select(.events[].content | contains("error"))'
+```
+
+## Verbose Mode Details
+
+### Setting Verbose Mode Programmatically
+
+From `crates/magpie-cli/src/main.rs:11`:
+
+```rust
+// Check for --trace flag
+let trace_enabled = args.iter().any(|a| a == "--trace");
+if trace_enabled {
+    magpie_core::set_trace_verbose(true);
+}
+```
+
+### How Trace Verbose Works
+
+The verbose flag is stored in an atomic boolean:
+
+```rust
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static TRACE_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_trace_verbose(enabled: bool) {
+    TRACE_VERBOSE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn is_trace_verbose() -> bool {
+    TRACE_VERBOSE.load(Ordering::Relaxed)
+}
+```
+
+This allows trace mode to be controlled globally without passing flags through every function call.
+
+## TraceBuilder API
+
+The `TraceBuilder` is used internally to record agent calls. Understanding it helps when debugging or extending Magpie.
+
+### Creating a Trace
+
+From `crates/magpie-core/src/trace.rs`:
+
+```rust
+use crate::trace::{TraceBuilder, EventKind};
+
+// Create a new trace
+let mut tb = TraceBuilder::new("step-name", "Agent prompt text");
+
+// Record events
+tb.record_event(EventKind::Text, "Agent response text");
+tb.record_event(EventKind::ToolRequest, "edit_file(...)");
+tb.record_event(EventKind::ToolResponse, "Success");
+
+// Finish and get trace
+let trace = tb.finish("Final response text");
+```
+
+### Event Kinds
+
+```rust
+pub enum EventKind {
+    Text,         // Agent generated text
+    ToolRequest,  // Agent requested a tool
+    ToolResponse, // Tool execution result
+}
+```
+
+### Writing Traces to Disk
+
+```rust
+use crate::trace::{write_trace, AgentCallTrace};
+use std::path::PathBuf;
+
+let trace = AgentCallTrace {
+    started_at: 1704067200000,
+    step_name: "test-step".to_string(),
+    prompt_preview: "test prompt".to_string(),
+    events: vec![/* events */],
+    response_preview: "test response".to_string(),
+    duration_ms: 500,
+    tool_call_count: 2,
+};
+
+let trace_dir = PathBuf::from(".magpie/traces");
+write_trace(&trace, &trace_dir)?;
+```
+
+## Error Handling Patterns
+
+Understanding Magpie's error handling helps with debugging.
+
+### Using anyhow for Error Context
+
+From `crates/magpie-core/src/pipeline.rs:1330`:
+
+```rust
+use anyhow::{Context, Result, bail};
+
+// Add context to errors
+let output = Command::new("claude")
+    .args(["-p", prompt])
+    .output()
+    .await
+    .context("failed to run `claude` CLI — is it installed and on PATH?")?;
+
+// Early return with custom error
+if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("claude CLI failed (exit {}): {}", output.status, stderr);
+}
+```
+
+### Error Context Chain
+
+Errors in Magpie use context chaining to provide detailed error messages:
+
+```
+Error: failed to create PR
+
+Caused by:
+    0: gh pr create failed: authentication required
+    1: failed to run gh CLI
+    2: command not found: gh
+```
+
+This shows the full error chain, making it easier to diagnose issues.
+
+### Common Error Patterns
+
+```rust
+// Command execution errors
+let output = sandbox.exec("cargo", &["test"])
+    .await
+    .context("failed to run cargo test")?;
+
+if output.exit_code != 0 {
+    bail!(
+        "cargo test failed (exit {}): {}",
+        output.exit_code,
+        output.stderr
+    );
+}
+
+// Network errors
+let response = client.post(&url)
+    .json(&payload)
+    .send()
+    .await
+    .context("failed to send request to Plane API")?;
+
+if !response.status().is_success() {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    bail!("Plane API failed ({status}): {text}");
+}
+
+// Validation errors
+if repo_name.is_empty() {
+    bail!("repo name cannot be empty");
+}
+```
+
+## Debugging Common Issues
+
+### Pipeline Fails During Setup
+
+**Symptoms**: Pipeline fails before agent runs
+
+**Debug steps**:
+
+1. Check environment variables:
+   ```bash
+   echo $MAGPIE_REPO_DIR
+   echo $MAGPIE_BASE_BRANCH
+   ```
+
+2. Verify git configuration:
+   ```bash
+   git config user.name
+   git config user.email
+   ```
+
+3. Check branch exists:
+   ```bash
+   git branch -a
+   ```
+
+### Agent Call Hangs
+
+**Symptoms**: Agent call never completes
+
+**Debug steps**:
+
+1. Run with `--trace` to see where it's stuck:
+   ```bash
+   cargo run -p magpie-cli -- --trace --pipeline "task"
+   ```
+
+2. Check if `claude` CLI is responsive:
+   ```bash
+   claude -p "test prompt"
+   ```
+
+3. Look for infinite loops in tool calls in trace output
+
+### CI Loop Keeps Failing
+
+**Symptoms**: Pipeline succeeds but CI never passes
+
+**Debug steps**:
+
+1. Run CI commands manually:
+   ```bash
+   cargo clippy -- -D warnings
+   cargo test
+   ```
+
+2. Check error output in trace files:
+   ```bash
+   cat .magpie/traces/*.jsonl | jq '.events[] | select(.kind == "ToolResponse") | .content'
+   ```
+
+3. Look for flaky tests or environment-specific issues
+
+### Sandbox Commands Fail
+
+**Symptoms**: Commands work locally but fail in sandbox
+
+**Debug steps**:
+
+1. Check sandbox working directory:
+   ```rust
+   println!("Working dir: {}", sandbox.working_dir());
+   ```
+
+2. Verify files exist in sandbox:
+   ```rust
+   let output = sandbox.exec("ls", &["-la"]).await?;
+   println!("Files: {}", output.stdout);
+   ```
+
+3. Check sandbox environment variables (Daytona):
+   ```bash
+   echo $DAYTONA_ENV
+   ```
+
+## Logging with tracing
+
+Magpie uses the `tracing` crate for structured logging.
+
+### Log Levels
+
+```rust
+use tracing::{debug, info, warn, error};
+
+// Verbose debugging information
+debug!(step = "test", "Running test step");
+
+// General information
+info!(branch = "feat-123", "Created branch");
+
+// Warning conditions
+warn!(exit_code = 1, "Test failed, retrying");
+
+// Error conditions
+error!(error = %e, "Pipeline failed");
+```
+
+### Setting Log Level
+
+```bash
+# Set via environment variable
+export RUST_LOG=debug
+cargo run -p magpie-cli -- --pipeline "task"
+
+# Different levels for different modules
+export RUST_LOG=magpie_core=debug,magpie_cli=info
+cargo run -p magpie-cli -- --pipeline "task"
+
+# Only show errors
+export RUST_LOG=error
+cargo run -p magpie-cli -- --pipeline "task"
+```
+
+### Log Output
+
+With `RUST_LOG=debug`, you'll see detailed logs:
+
+```
+2024-01-15T10:30:00.123Z DEBUG magpie_core::pipeline: Starting pipeline task="add health check"
+2024-01-15T10:30:01.456Z INFO  magpie_core::git: Created branch branch="feat-add-health-check"
+2024-01-15T10:30:05.789Z DEBUG magpie_core::agent: Agent call started step="implement" prompt_len=150
+2024-01-15T10:30:08.012Z INFO  magpie_core::agent: Agent call completed step="implement" duration_ms=2223 tools=3
+```
+
+## Performance Debugging
+
+### Trace File Analysis
+
+Find slow steps:
+
+```bash
+# Find slowest agent calls
+cat .magpie/traces/*.jsonl | jq -r '[.step_name, .duration_ms] | @tsv' | sort -k2 -rn | head -10
+
+# Average duration by step
+cat .magpie/traces/*.jsonl | jq -r '[.step_name, .duration_ms] | @tsv' | 
+  awk '{sum[$1]+=$2; count[$1]++} END {for (step in sum) print step, sum[step]/count[step]}'
+```
+
+### Tool Call Analysis
+
+Find steps with many tool calls:
+
+```bash
+# Steps with most tool calls
+cat .magpie/traces/*.jsonl | jq -r '[.step_name, .tool_call_count] | @tsv' | sort -k2 -rn
+
+# What tools are being called?
+cat .magpie/traces/*.jsonl | jq -r '.events[] | select(.kind == "ToolRequest") | .content' | sort | uniq -c | sort -rn
+```
+
+## Debugging in Tests
+
+When writing tests, you can enable debug output:
+
+```rust
+#[tokio::test]
+async fn test_with_debug() {
+    // Initialize tracing for this test
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+    
+    // Your test code...
+    info!("Test started");
+    // ...
+}
+```
+
+Or run tests with output:
+
+```bash
+# Show all output including prints and logs
+cargo test -- --nocapture
+
+# With RUST_LOG
+RUST_LOG=debug cargo test -- --nocapture
+```
+
+## Debugging Daytona Sandboxes
+
+When using Daytona sandboxes:
+
+```bash
+# Check sandbox creation
+export RUST_LOG=debug
+export DAYTONA_API_KEY=your-key
+cargo run -p magpie-cli -- --trace --pipeline "task"
+
+# Manually create and inspect sandbox
+curl -H "Authorization: Bearer $DAYTONA_API_KEY" \
+  https://app.daytona.io/api/sandboxes
+
+# Check sandbox logs
+curl -H "Authorization: Bearer $DAYTONA_API_KEY" \
+  https://app.daytona.io/api/sandboxes/{sandbox_id}/logs
+```
+
+## Summary
+
+**Key debugging tools**:
+- `--trace` flag for real-time output and JSONL logs
+- JSONL trace files in `.magpie/traces/`
+- `RUST_LOG` environment variable for log levels
+- Error context chains with `anyhow`
+- `MockSandbox` for isolated testing
+
+**Quick debugging checklist**:
+1. Run with `--trace` to see what's happening
+2. Check trace files for patterns or errors
+3. Verify environment variables and configuration
+4. Run commands manually to isolate issues
+5. Check logs with `RUST_LOG=debug`
+6. Test error cases with `MockSandbox`
+
+**Common commands**:
+```bash
+# Basic tracing
+cargo run -p magpie-cli -- --trace --pipeline "task"
+
+# With debug logs
+RUST_LOG=debug cargo run -p magpie-cli -- --trace --pipeline "task"
+
+# Analyze traces
+cat .magpie/traces/*.jsonl | jq .
+
+# Find slow steps
+cat .magpie/traces/*.jsonl | jq -r '[.step_name, .duration_ms] | @tsv' | sort -k2 -rn
+```

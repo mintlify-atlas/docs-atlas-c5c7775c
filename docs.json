@@ -1,122 +1,148 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Magpie",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#E63946",
+    "light": "#F1FAEE",
+    "dark": "#1D3557"
   },
-  "favicon": "/favicon.svg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/niteshballa/magpie"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/niteshballa/magpie"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
+              "introduction",
               "quickstart",
-              "development"
+              "installation"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/architecture",
+              "concepts/pipeline",
+              "concepts/blueprints",
+              "concepts/two-tier-agent",
+              "concepts/task-classification",
+              "concepts/sandbox"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Chat Adapters",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "adapters/discord",
+              "adapters/teams",
+              "adapters/cli",
+              "adapters/custom"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Configuration",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "configuration/pipeline",
+              "configuration/environment",
+              "configuration/plane",
+              "configuration/sandbox"
+            ]
+          },
+          {
+            "group": "Blueprints",
+            "pages": [
+              "blueprints/overview",
+              "blueprints/simple",
+              "blueprints/tdd",
+              "blueprints/diagnostic",
+              "blueprints/custom"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/org-scoped-repos",
+              "advanced/tracing",
+              "advanced/ci-classification",
+              "advanced/daytona-integration"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "API Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Core",
             "pages": [
-              "api-reference/introduction"
+              "api/pipeline",
+              "api/agent",
+              "api/blueprint-engine",
+              "api/git-ops"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Integrations",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/chat-platform",
+              "api/sandbox",
+              "api/plane-client",
+              "api/repo-resolution"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/types/pipeline-config",
+              "api/types/pipeline-result",
+              "api/types/task-complexity",
+              "api/types/blueprint"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Deployment",
+            "pages": [
+              "guides/deploying-discord-bot",
+              "guides/deploying-teams-bot",
+              "guides/docker-setup"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "guides/contributing",
+              "guides/testing",
+              "guides/debugging"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/simple-task",
+              "examples/feature-with-tdd",
+              "examples/bug-fix",
+              "examples/multi-repo"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

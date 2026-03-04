@@ -1,0 +1,359 @@
+---
+title: Task Classification
+description: How Magpie classifies tasks into Simple, Standard, and BugFix to choose the right blueprint
+---
+
+Before running the agent, Magpie classifies each task to determine which blueprint path to execute. This ensures the right workflow runs for each type of work.
+
+## TaskComplexity Enum
+
+```rust title="pipeline.rs:90-102"
+/// How complex a task is — determines which blueprint path to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskComplexity {
+    /// Docs, typos, renames — fast single-shot agent call.
+    Simple,
+    /// Features, refactors, integrations — TDD plan→test→implement flow.
+    Standard,
+    /// Bug fixes — diagnostic investigate→plan→test→fix flow.
+    BugFix,
+}
+```
+
+## Complexity to Blueprint Mapping
+
+<CardGroup cols={3}>
+  <Card title="Simple" icon="file-lines">
+    **magpie-main**
+    
+    Single-shot agent call
+    
+    _Docs, typos, renames, formatting_
+  </Card>
+  <Card title="Standard" icon="flask">
+    **magpie-tdd**
+    
+    TDD: plan → write tests → implement
+    
+    _Features, refactors, integrations_
+  </Card>
+  <Card title="BugFix" icon="bug">
+    **magpie-diagnostic**
+    
+    Investigate → plan → test → fix
+    
+    _Bugs, crashes, regressions_
+  </Card>
+</CardGroup>
+
+## Classification Algorithm
+
+```rust title="pipeline.rs:166-230"
+pub async fn classify_task(
+    task: &str,
+    dry_run: bool,
+    trace_dir: Option<&PathBuf>,
+) -> TaskComplexity {
+    let lower = task.to_lowercase();
+
+    // Fast path: simple keywords (checked first — "fix typo" is Simple, not BugFix)
+    if SIMPLE_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        info!(task, "classified as Simple (keyword match)");
+        return TaskComplexity::Simple;
+    }
+
+    // Fast path: bugfix keywords
+    if BUGFIX_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        info!(task, "classified as BugFix (keyword match)");
+        return TaskComplexity::BugFix;
+    }
+
+    // Fast path: standard keywords
+    if STANDARD_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        info!(task, "classified as Standard (keyword match)");
+        return TaskComplexity::Standard;
+    }
+
+    // Ambiguous — use Claude to classify (or default to Simple in dry_run)
+    if dry_run {
+        info!(task, "ambiguous task in dry_run → defaulting to Simple");
+        return TaskComplexity::Simple;
+    }
+
+    info!(task, "ambiguous task → asking Claude to classify");
+    let prompt = format!(
+        "Classify this task as either SIMPLE, STANDARD, or BUGFIX.\n\n\
+         SIMPLE = documentation changes, typo fixes, renames, formatting, trivial edits.\n\
+         STANDARD = new features, refactors, integrations, anything that needs tests.\n\
+         BUGFIX = fixing bugs, crashes, errors, regressions, investigating broken behavior.\n\n\
+         Task: {task}\n\n\
+         Reply with ONLY the word SIMPLE, STANDARD, or BUGFIX, nothing else."
+    );
+
+    match claude_call(&prompt, "classify", trace_dir).await {
+        Ok(response) => {
+            let upper = response.trim().to_uppercase();
+            if upper.contains("SIMPLE") {
+                info!(task, "agent classified as Simple");
+                TaskComplexity::Simple
+            } else if upper.contains("BUGFIX") {
+                info!(task, "agent classified as BugFix");
+                TaskComplexity::BugFix
+            } else {
+                info!(task, "agent classified as Standard (default for ambiguous)");
+                TaskComplexity::Standard
+            }
+        }
+        Err(e) => {
+            warn!(task, error = %e, "classification claude_call failed → defaulting to Standard");
+            TaskComplexity::Standard
+        }
+    }
+}
+```
+
+## Keyword Lists
+
+### Simple Keywords
+
+```rust title="pipeline.rs:104-124"
+const SIMPLE_KEYWORDS: &[&str] = &[
+    "fix typo",
+    "fix the typo",
+    "update readme",
+    "update the readme",
+    "fix docs",
+    "fix the docs",
+    "update docs",
+    "update the docs",
+    "update changelog",
+    "update the changelog",
+    "rename",
+    "fix comment",
+    "fix comments",
+    "fix spelling",
+    "fix whitespace",
+    "fix formatting",
+    "update license",
+    "fix license",
+];
+```
+
+<Info>
+Simple keywords are checked **first** so that `"fix typo"` is classified as Simple, not BugFix (even though it contains `"fix"`).
+</Info>
+
+### BugFix Keywords
+
+```rust title="pipeline.rs:126-145"
+const BUGFIX_KEYWORDS: &[&str] = &[
+    "fix bug",
+    "fix the bug",
+    "fix crash",
+    "fix the crash",
+    "fix error",
+    "fix the error",
+    "fix panic",
+    "fix the panic",
+    "broken",
+    "not working",
+    "regression",
+    "debug",
+    "investigate",
+    "root cause",
+    "diagnose",
+];
+```
+
+### Standard Keywords
+
+```rust title="pipeline.rs:147-164"
+const STANDARD_KEYWORDS: &[&str] = &[
+    "add",
+    "implement",
+    "create",
+    "build",
+    "refactor",
+    "migrate",
+    "integrate",
+    "introduce",
+    "design",
+    "architect",
+    "extract",
+    "replace",
+    "rewrite",
+    "optimize",
+    "convert",
+];
+```
+
+## Classification Examples
+
+<CodeGroup>
+
+```bash Simple
+# Keyword match: "fix typo"
+@magpie fix typo in README.md
+→ TaskComplexity::Simple
+→ magpie-main blueprint
+```
+
+```bash Standard
+# Keyword match: "add"
+@magpie add OAuth2 authentication
+→ TaskComplexity::Standard
+→ magpie-tdd blueprint
+```
+
+```bash BugFix
+# Keyword match: "fix crash"
+@magpie fix crash when user clicks logout
+→ TaskComplexity::BugFix
+→ magpie-diagnostic blueprint
+```
+
+```bash Ambiguous (Claude fallback)
+# No keyword match → ask Claude
+@magpie improve performance of the API
+→ claude_call("Classify: improve performance...")
+→ Claude responds: STANDARD
+→ TaskComplexity::Standard
+→ magpie-tdd blueprint
+```
+
+</CodeGroup>
+
+## Tier 1 Classification
+
+Ambiguous tasks use a Tier 1 Claude CLI call:
+
+```rust
+let prompt = format!(
+    "Classify this task as either SIMPLE, STANDARD, or BUGFIX.\n\n\
+     SIMPLE = documentation changes, typo fixes, renames, formatting, trivial edits.\n\
+     STANDARD = new features, refactors, integrations, anything that needs tests.\n\
+     BUGFIX = fixing bugs, crashes, errors, regressions, investigating broken behavior.\n\n\
+     Task: {task}\n\n\
+     Reply with ONLY the word SIMPLE, STANDARD, or BUGFIX, nothing else."
+);
+
+match claude_call(&prompt, "classify", trace_dir).await {
+    Ok(response) => {
+        let upper = response.trim().to_uppercase();
+        if upper.contains("SIMPLE") {
+            TaskComplexity::Simple
+        } else if upper.contains("BUGFIX") {
+            TaskComplexity::BugFix
+        } else {
+            TaskComplexity::Standard  // default for ambiguous
+        }
+    }
+    Err(e) => TaskComplexity::Standard  // fallback on error
+}
+```
+
+<Note>
+If the Claude call fails, the pipeline defaults to `Standard` (safest choice — runs full TDD flow).
+</Note>
+
+## Fallback Behavior
+
+```rust
+if dry_run {
+    info!(task, "ambiguous task in dry_run → defaulting to Simple");
+    return TaskComplexity::Simple;
+}
+```
+
+In dry-run mode (testing), ambiguous tasks default to Simple without calling Claude.
+
+## Usage in Pipeline
+
+```rust title="pipeline.rs:960-1055"
+progress(platform, channel_id, "Analyzing task...").await;
+let complexity = classify_task(task, config.dry_run, config.trace_dir.as_ref()).await;
+info!(?complexity, "task classified");
+
+match complexity {
+    TaskComplexity::Standard => {
+        progress(platform, channel_id, "Planning approach...").await;
+        let (bp, ctx) = build_tdd_blueprint(&trigger, config, &working_dir)?;
+        BlueprintRunner::new(ctx, &*sandbox).run(&bp).await?
+    }
+    TaskComplexity::BugFix => {
+        progress(platform, channel_id, "Investigating bug...").await;
+        let (bp, ctx) = build_diagnostic_blueprint(&trigger, config, &working_dir)?;
+        BlueprintRunner::new(ctx, &*sandbox).run(&bp).await?
+    }
+    TaskComplexity::Simple => {
+        progress(platform, channel_id, "Working on it...").await;
+        let (bp, ctx) = build_main_blueprint(&trigger, config, &working_dir)?;
+        BlueprintRunner::new(ctx, &*sandbox).run(&bp).await?
+    }
+}
+```
+
+## Decision Tree
+
+```mermaid
+graph TD
+    A[Task: {task}] --> B{Contains SIMPLE keyword?}
+    B -->|Yes| C[Simple]
+    B -->|No| D{Contains BUGFIX keyword?}
+    D -->|Yes| E[BugFix]
+    D -->|No| F{Contains STANDARD keyword?}
+    F -->|Yes| G[Standard]
+    F -->|No| H{Dry run?}
+    H -->|Yes| I[Default: Simple]
+    H -->|No| J[Claude: classify]
+    J --> K{Response?}
+    K -->|SIMPLE| C
+    K -->|BUGFIX| E
+    K -->|STANDARD or error| G
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Be explicit in task descriptions">
+    Use clear keywords to avoid ambiguous classification:
+    - `"add feature"` → Standard
+    - `"fix bug"` → BugFix
+    - `"fix typo"` → Simple
+  </Accordion>
+  
+  <Accordion title="Order matters for SIMPLE keywords">
+    `"fix typo"` is checked before `"fix bug"` to prevent false BugFix classification.
+  </Accordion>
+  
+  <Accordion title="Ambiguous tasks default to Standard">
+    If no keywords match and Claude call fails, Standard is the safest choice (runs full TDD flow).
+  </Accordion>
+  
+  <Accordion title="Dry run behavior">
+    In dry-run mode, ambiguous tasks default to Simple to minimize overhead during testing.
+  </Accordion>
+</AccordionGroup>
+
+## Impact on Pipeline
+
+| Complexity | Blueprint | Steps | Test Strategy |
+|------------|-----------|-------|---------------|
+| **Simple** | `magpie-main` | 2 | None (docs-only) |
+| **Standard** | `magpie-tdd` | 7 | Write tests first (TDD) |
+| **BugFix** | `magpie-diagnostic` | 8 | Regression test after investigation |
+
+<Info>
+Classification happens **after** branch creation but **before** agent execution. This ensures the git branch is ready regardless of which blueprint runs.
+</Info>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Blueprints" icon="diagram-project" href="/concepts/blueprints">
+    See the full blueprint flows for each complexity level
+  </Card>
+  <Card title="Two-Tier Agent" icon="layer-group" href="/concepts/two-tier-agent">
+    Learn how Tier 1 Claude calls handle classification
+  </Card>
+</CardGroup>

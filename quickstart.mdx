@@ -1,80 +1,319 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get Magpie running in minutes and trigger your first autonomous coding task
 ---
 
-## Get started in three steps
+<Note>
+  **What you'll accomplish**: Install Magpie, configure your environment, and run your first end-to-end pipeline from task to pull request.
+</Note>
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, ensure you have the following tools installed:
 
 <AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+  <Accordion icon="rust" title="Rust 1.75+">
+    Magpie is written in Rust. Install via [rustup](https://rustup.rs/):
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+    
+    Verify your installation:
+    
+    ```bash
+    rustc --version
+    # Should show 1.75.0 or higher
+    ```
   </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+
+  <Accordion icon="terminal" title="Claude CLI">
+    Required for both Tier 1 (text generation) and Tier 2 (Goose agent). See [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code) for setup.
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
+    After installation, verify:
+    
+    ```bash
+    claude --version
+    ```
+    
+    <Warning>
+      The Claude CLI must be authenticated. Run `claude` once interactively to complete setup.
+    </Warning>
+  </Accordion>
+
+  <Accordion icon="git-alt" title="Git and GitHub CLI">
+    Git is required for branch operations. The GitHub CLI (`gh`) handles PR creation.
+    
+    **Install Git**: [git-scm.com/downloads](https://git-scm.com/downloads)
+    
+    **Install GitHub CLI**:
+    
+    ```bash
+    # macOS
+    brew install gh
+    
+    # Linux (Debian/Ubuntu)
+    sudo apt install gh
+    
+    # Windows
+    winget install --id GitHub.cli
+    ```
+    
+    Authenticate with GitHub:
+    
+    ```bash
+    gh auth login
+    ```
   </Accordion>
 </AccordionGroup>
 
-### Step 2: Deploy your changes
+## Install Magpie
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/your-org/magpie.git
+    cd magpie
+    ```
+  </Step>
+
+  <Step title="Build the project">
+    ```bash
+    cargo build --release
+    ```
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    <Info>
+      First build takes 4-5 minutes due to Goose transitive dependencies (candle, llama-cpp, tree-sitter). Subsequent builds are much faster.
+    </Info>
+    
+    The binary will be available at `target/release/magpie-cli`.
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Verify the installation">
+    ```bash
+    ./target/release/magpie-cli --help
+    ```
+    
+    You should see usage information for the Magpie CLI.
+  </Step>
+</Steps>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+## Run your first task
 
-### Step 3: Go live
+Let's test Magpie with a simple agent prompt before running the full pipeline.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+<Steps>
+  <Step title="Run a single prompt">
+    ```bash
+    ./target/release/magpie-cli "Explain the pipeline module in 2 sentences"
+    ```
+    
+    This invokes the Tier 2 agent (Goose) with the prompt. You should see a streaming response explaining the pipeline architecture.
+  </Step>
+
+  <Step title="Try the blueprint demo">
+    ```bash
+    ./target/release/magpie-cli --demo
+    ```
+    
+    This runs a demo blueprint that:
+    1. Lists files in the current directory (Shell step)
+    2. Asks the agent to summarize the listing (Agent step)
+    
+    **Example output from the demo**:
+    
+    ```
+    === Magpie Blueprint Demo ===
+    
+    Running blueprint: demo-blueprint
+    
+    === Result ===
+    The directory contains a Rust workspace with four crates...
+    ```
+  </Step>
+</Steps>
+
+## Configure for full pipeline
+
+To run the complete pipeline (task → code → CI → PR), configure these environment variables:
+
+<CodeGroup>
+```bash .env
+# Repository configuration
+MAGPIE_REPO_DIR=/path/to/your/repo
+MAGPIE_BASE_BRANCH=main
+
+# CI commands (customize for your project)
+MAGPIE_TEST_CMD="cargo test"
+MAGPIE_LINT_CMD="cargo clippy -- -D warnings"
+MAGPIE_MAX_CI_ROUNDS=2
+
+# Optional: GitHub org for multi-repo support
+MAGPIE_GITHUB_ORG=your-org-name
+
+# Optional: Plane issue tracking
+PLANE_BASE_URL=https://plane.yourcompany.com
+PLANE_API_KEY=your-api-key
+PLANE_WORKSPACE_SLUG=your-workspace
+PLANE_PROJECT_ID=your-project-id
+```
+
+```bash Export (alternative)
+export MAGPIE_REPO_DIR="/path/to/your/repo"
+export MAGPIE_BASE_BRANCH="main"
+export MAGPIE_TEST_CMD="cargo test"
+export MAGPIE_LINT_CMD="cargo clippy"
+```
+</CodeGroup>
+
+<Info>
+  Create a `.env` file in your working directory, and Magpie will automatically load it at startup via `dotenvy::dotenv()`.
+</Info>
+
+## Run the full pipeline
+
+Now trigger an end-to-end autonomous coding task:
+
+```bash
+./target/release/magpie-cli --pipeline "add a health check endpoint to the API"
+```
+
+### What happens next
+
+<Steps>
+  <Step title="Task classification">
+    Magpie analyzes your task description and classifies it:
+    
+    - **Simple**: docs, typos, renames → single agent call
+    - **Standard**: features, refactors → TDD blueprint (plan → tests → implement)
+    - **BugFix**: bug fixes → diagnostic blueprint (investigate → regression test → fix)
+    
+    For "add a health check endpoint", Magpie will classify this as **Standard** and use the TDD blueprint.
+  </Step>
+
+  <Step title="Blueprint execution">
+    The agent executes the TDD blueprint steps:
+    
+    ```
+    scan-repo → plan → write-tests → verify-tests-fail 
+    → implement → run-tests → lint-check
+    ```
+    
+    You'll see streaming output as the agent:
+    - Scans the repository structure
+    - Plans the implementation
+    - Writes test cases first (red phase)
+    - Implements the feature to pass tests (green phase)
+    - Runs `cargo test` and `cargo clippy`
+  </Step>
+
+  <Step title="CI loop">
+    After coding completes, Magpie runs your configured test and lint commands. If CI fails, the fix blueprint gives the agent the error output and attempts repairs (up to `MAGPIE_MAX_CI_ROUNDS`).
+  </Step>
+
+  <Step title="Commit and PR">
+    Once tests pass:
+    
+    1. **Branch creation**: Creates `magpie/add-health-check-endpoint` (with collision handling if needed)
+    2. **Commit**: Generates a conventional commit message via Tier 1 Claude call
+    3. **Push**: Pushes to origin with `-u` flag
+    4. **PR**: Opens a pull request via `gh pr create`
+    
+    You'll see output like:
+    
+    ```
+    === Pipeline Result ===
+    Status:     Success
+    CI passed:  true
+    Rounds:     1
+    PR:         https://github.com/your-org/your-repo/pull/247
+    ```
+  </Step>
+</Steps>
+
+## Enable tracing (optional)
+
+To debug agent behavior, enable JSONL tracing:
+
+```bash
+./target/release/magpie-cli --trace --pipeline "fix the login bug"
+```
+
+This creates `.magpie/traces/magpie-trace-YYYY-MM-DD.jsonl` with detailed logs of every agent call:
+
+```json
+{
+  "step_name": "implement",
+  "prompt_preview": "Implement the health check endpoint...",
+  "response_preview": "I'll add a new route at /health...",
+  "wall_clock_ms": 8234,
+  "tool_call_count": 5,
+  "timestamp": "2026-03-04T09:15:32Z",
+  "events": [
+    {"kind": "Text", "content": "I'll add a new route...", "timestamp": "..."},
+    {"kind": "ToolRequest", "content": "[ToolRequest: write_file]...", "timestamp": "..."}
+  ]
+}
+```
+
+<Tip>
+  Use `--trace` during development to understand how the agent interprets your tasks and which tools it uses.
+</Tip>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Chat adapters" icon="comments" href="/adapters/discord">
+    Set up Discord or Teams to trigger tasks from chat messages
+  </Card>
+  
+  <Card title="Blueprint engine" icon="sitemap" href="/concepts/blueprints">
+    Learn how deterministic and agent steps combine in blueprints
+  </Card>
+  
+  <Card title="Configuration" icon="sliders" href="/configuration/environment">
+    Explore all environment variables and options
+  </Card>
+  
+  <Card title="Sandbox options" icon="box" href="/concepts/sandbox">
+    Run tasks in Daytona sandboxes for isolated execution
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+## Common issues
+
+<AccordionGroup>
+  <Accordion title="Error: claude: command not found">
+    The Claude CLI is not installed or not in your PATH. Follow the [Claude Code setup guide](https://docs.anthropic.com/en/docs/claude-code).
+  </Accordion>
+
+  <Accordion title="Error: gh: command not found">
+    Install the GitHub CLI:
+    
+    ```bash
+    # macOS
+    brew install gh
+    
+    # Linux
+    sudo apt install gh
+    ```
+    
+    Then authenticate: `gh auth login`
+  </Accordion>
+
+  <Accordion title="Build fails with candle/llama-cpp errors">
+    Ensure you're using Rust 1.75+ and have a C++ compiler installed:
+    
+    ```bash
+    # macOS
+    xcode-select --install
+    
+    # Linux (Debian/Ubuntu)
+    sudo apt install build-essential
+    ```
+  </Accordion>
+
+  <Accordion title="Agent doesn't make file changes">
+    Verify the agent has write permissions to `MAGPIE_REPO_DIR`. The agent uses Goose's file tools, which operate relative to the working directory set in the session.
+  </Accordion>
+</AccordionGroup>
