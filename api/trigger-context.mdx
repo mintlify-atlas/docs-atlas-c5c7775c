@@ -1,0 +1,197 @@
+---
+title: TriggerContext
+description: Platform-agnostic trigger data that flows from chat adapters to the pipeline
+---
+
+## Overview
+
+`TriggerContext` is a platform-agnostic struct that carries trigger metadata from any chat adapter (Discord, Teams, CLI) into the pipeline. It captures who triggered the task, from where, and includes the full conversation history for context.
+
+## Type Definition
+
+```rust
+pub struct TriggerContext {
+    pub source: String,
+    pub channel_id: String,
+    pub user: String,
+    pub message: String,
+    pub chat_history: String,
+}
+```
+
+<ResponseField name="source" type="String">
+  Platform identifier (e.g., `"discord"`, `"teams"`, `"cli"`)
+</ResponseField>
+
+<ResponseField name="channel_id" type="String">
+  Channel or thread ID from the originating platform. For CLI, this is typically `"local"`.
+</ResponseField>
+
+<ResponseField name="user" type="String">
+  Username or identifier of the person who triggered the pipeline
+</ResponseField>
+
+<ResponseField name="message" type="String">
+  The trigger message with @mention stripped. This is the raw task description.
+</ResponseField>
+
+<ResponseField name="chat_history" type="String">
+  Full conversation history from the channel/thread. Used to provide context to the agent.
+</ResponseField>
+
+## Methods
+
+### `hydrate()`
+
+Populates a `StepContext`'s metadata HashMap with well-known keys from this trigger.
+
+```rust
+pub fn hydrate(&self, ctx: &mut StepContext)
+```
+
+<ParamField path="ctx" type="&mut StepContext" required>
+  The step context to populate with trigger metadata
+</ParamField>
+
+**Metadata Keys Populated:**
+- `"source"` → platform identifier
+- `"channel_id"` → channel/thread ID
+- `"user"` → triggering user
+- `"message"` → task message (mention-stripped)
+- `"chat_history"` → conversation history
+
+**Example:**
+
+```rust
+use magpie_core::{TriggerContext, StepContext};
+use std::path::PathBuf;
+
+let trigger = TriggerContext {
+    source: "discord".to_string(),
+    channel_id: "123456789".to_string(),
+    user: "alice".to_string(),
+    message: "fix login bug".to_string(),
+    chat_history: "alice: the login is broken\nbob: what error do you see?".to_string(),
+};
+
+let mut ctx = StepContext::new(PathBuf::from("/repo"));
+trigger.hydrate(&mut ctx);
+
+// Metadata now contains all trigger fields
+assert_eq!(ctx.metadata.get("source").unwrap(), "discord");
+assert_eq!(ctx.metadata.get("user").unwrap(), "alice");
+```
+
+## Usage in Pipeline
+
+The pipeline creates a `TriggerContext` from the incoming request and passes it to blueprint execution:
+
+```rust
+// Discord adapter
+let trigger = TriggerContext {
+    source: "discord".to_string(),
+    channel_id: thread_id.to_string(),
+    user: author.name.clone(),
+    message: stripped_content,
+    chat_history: fetch_thread_history(thread_id).await?,
+};
+
+run_pipeline(&config, platform, &trigger).await?;
+```
+
+Inside blueprints, agent steps receive this context via `StepContext.metadata`:
+
+```rust
+let chat_history = ctx.metadata.get("chat_history").unwrap_or(&String::new());
+let user = ctx.metadata.get("user").unwrap_or(&String::new());
+
+let prompt = format!(
+    "User {user} requested: {task}\n\nContext:\n{chat_history}"
+);
+```
+
+## Platform-Specific Examples
+
+### Discord
+
+```rust
+use magpie_core::TriggerContext;
+
+let trigger = TriggerContext {
+    source: "discord".to_string(),
+    channel_id: message.channel_id.to_string(),
+    user: message.author.name.clone(),
+    message: content.trim_start_matches("<@123456>").trim().to_string(),
+    chat_history: fetch_thread_messages(channel_id).await?,
+};
+```
+
+### Teams
+
+```rust
+use magpie_core::TriggerContext;
+
+let trigger = TriggerContext {
+    source: "teams".to_string(),
+    channel_id: activity.conversation.id.clone(),
+    user: activity.from.name.clone(),
+    message: activity.text.replace("<at>magpie</at>", "").trim().to_string(),
+    chat_history: fetch_conversation_history(&activity.conversation.id).await?,
+};
+```
+
+### CLI
+
+```rust
+use magpie_core::TriggerContext;
+
+let trigger = TriggerContext {
+    source: "cli".to_string(),
+    channel_id: "local".to_string(),
+    user: std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()),
+    message: task.clone(),
+    chat_history: String::new(), // No conversation history for CLI
+};
+```
+
+## Design Rationale
+
+### Why Platform-Agnostic?
+
+`TriggerContext` decouples the pipeline from platform-specific details:
+
+- **Discord** has threads, mentions, and snowflake IDs
+- **Teams** has conversations, activities, and AAD identities
+- **CLI** has none of these concepts
+
+By abstracting to `source`, `channel_id`, `user`, `message`, and `chat_history`, the pipeline and blueprints work identically regardless of origin.
+
+### Why Include Chat History?
+
+Chat history provides crucial context for the agent:
+
+- **Requirements clarification**: "alice: add OAuth → bob: which provider? → alice: Google"
+- **Error details**: Stack traces, screenshots, or error messages shared in the thread
+- **Design decisions**: "alice: use JWT → bob: 24hr expiry?"
+
+Without history, the agent sees only the trigger message, missing important context.
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="ChatPlatform Trait" icon="comments" href="/api/chat-platform">
+    Implement custom chat adapters that produce TriggerContext
+  </Card>
+  
+  <Card title="Pipeline API" icon="diagram-project" href="/api/pipeline">
+    How run_pipeline() consumes TriggerContext
+  </Card>
+  
+  <Card title="Blueprint Types" icon="sitemap" href="/api/types/blueprint">
+    How StepContext.metadata carries trigger data to agent steps
+  </Card>
+  
+  <Card title="Discord Adapter" icon="discord" href="/adapters/discord">
+    Real-world example of TriggerContext creation
+  </Card>
+</CardGroup>

@@ -99,7 +99,8 @@
               "api/chat-platform",
               "api/sandbox",
               "api/plane-client",
-              "api/repo-resolution"
+              "api/repo-resolution",
+              "api/trigger-context"
             ]
           },
           {
